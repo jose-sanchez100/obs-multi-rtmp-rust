@@ -51,7 +51,8 @@ New in this reimplementation:
 - Windows 10/11 x64, Linux x86_64, or macOS 12 or newer (Apple Silicon or Intel)
 - OBS Studio 33 or newer (64-bit)
 
-On Linux the plugin must be built from source (see [Building on Linux](#building-on-linux)).
+The Linux package is built on Ubuntu 26.04 against OBS 33 from the official PPA; on other
+distributions, build from source (see [Building on Linux](#building-on-linux)).
 The Flatpak version of OBS cannot load plugins installed this way; use OBS from your
 distribution or the official PPA.
 
