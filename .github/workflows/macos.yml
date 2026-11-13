@@ -63,9 +63,6 @@ jobs:
             exit 1
           fi
 
-      - name: Engine tests
-        run: cargo test --release -p obs-rtmp-sessions
-
       # Summary of the package as an annotation (readable without signing in).
       - name: Inspect package
         run: |
@@ -87,6 +84,15 @@ jobs:
           path: |
             dist/*-macos-universal.pkg
             dist/*-macos-universal.zip
+
+      - name: Engine tests
+        run: |
+          set -o pipefail
+          if ! cargo test --release -p obs-rtmp-sessions 2>&1 | tee "$RUNNER_TEMP/test.log"; then
+            grep -E 'panicked|FAILED|failures:|test result|assert|left|right|primary=' "$RUNNER_TEMP/test.log" | tail -n 40               | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}' > "$RUNNER_TEMP/tail.txt"
+            echo "::error title=Engine tests failed::$(cat "$RUNNER_TEMP/tail.txt")"
+            exit 1
+          fi
 
       - name: Remove signing keychain
         if: always() && env.HAVE_SIGNING_CERT == 'true'
