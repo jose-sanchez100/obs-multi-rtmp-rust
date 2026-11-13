@@ -60,6 +60,12 @@ distribution or the official PPA.
 This plugin replaces the original obs-multi-rtmp (same DLL name and same configuration file).
 Close OBS before installing or removing it.
 
+Download the package for your platform from the
+[Releases](https://github.com/jose-sanchez100/obs-multi-rtmp-rust/releases) page; each release
+lists the SHA-256 of every file in `SHA256SUMS.txt`. The packages are not signed with a paid
+certificate, so Windows SmartScreen may warn about the installer ("More info" → "Run anyway")
+and macOS asks you to allow it (see below).
+
 **Installer:** run `obs-multi-rtmp-rust-<version>-windows-x64-Installer.exe`. It installs to
 `C:\ProgramData\obs-studio\plugins\obs-multi-rtmp`, replacing the original plugin if present.
 Running it again offers to update or remove the plugin; removing it keeps your targets,
@@ -102,15 +108,22 @@ xattr -r -d com.apple.quarantine ~/Library/Application\ Support/obs-studio/plugi
 Prerequisites:
 
 - Rust (stable, MSVC toolchain) and Visual Studio 2022 with the C++ workload.
-- OBS 33 headers and import libraries (`obs.lib`, `obs-frontend-api.lib`) and the Qt 6
-  package from `obs-deps`. The easiest way to get them is to configure the original
-  [obs-multi-rtmp](https://github.com/sorayuki/obs-multi-rtmp) (based on
-  `obs-plugintemplate`), which downloads them into its `.deps` folder.
+- CMake, to prepare the OBS 33 headers and import libraries (`obs.lib`,
+  `obs-frontend-api.lib`) and the Qt 6 package from `obs-deps`:
+
+  ```powershell
+  .\plugin\setup-deps-windows.ps1
+  ```
+
+  It does what the original plugin's buildspec does: downloads the OBS sources, obs-deps and
+  Qt 6 (SHA-256 checked) into `.deps-windows\` and builds libobs and obs-frontend-api.
+  A `.deps` folder from configuring the original
+  [obs-multi-rtmp](https://github.com/sorayuki/obs-multi-rtmp) works too.
 
 Environment variables read by `plugin/build.rs`:
 
-- `OBS_DEPS_DIR` — folder containing OBS `include/` and `lib/`
-  (default: `../obs-multi-rtmp/.deps` next to this repository).
+- `OBS_DEPS_DIR` — folder containing OBS `include/` and `lib/` (default: `.deps-windows`
+  in this repository if it exists, else `../obs-multi-rtmp/.deps` next to this repository).
 - `OBS_QT_DIR` — Qt 6 folder (default: `<OBS_DEPS_DIR>/obs-deps-qt6-2026-10-23-x64`).
 
 ```bash
@@ -149,7 +162,7 @@ development files the way the original plugin does (downloads the OBS sources, o
 Qt 6 for macOS into `.deps-macos/` and builds libobs and obs-frontend-api), builds the plugin
 for Apple Silicon and Intel, and writes a universal `.pkg` and `.zip` to `dist/`.
 
-The `macOS` GitHub Actions workflow runs the same script on every push and
+The `Build` GitHub Actions workflow runs the same script on every push and
 uploads the packages as a build artifact.
 
 Without further setup the plugin gets an ad-hoc signature and the installer is unsigned.
@@ -179,6 +192,22 @@ plugin's packaging script:
 On Linux, `bash plugin/package.sh` writes `dist/obs-multi-rtmp-rust-<version>-linux-x86_64.tar.gz`.
 On macOS, `bash plugin/package-macos.sh` writes `obs-multi-rtmp-rust-<version>-macos-universal.pkg`
 and `.zip`.
+
+### Releases
+
+The `Build` workflow (`.github/workflows/build.yml`) builds, packages and tests the plugin on
+Windows, Linux (Ubuntu 26.04 container) and macOS on every push, and uploads the packages as
+build artifacts. To make a release, set the version in `plugin/Cargo.toml`, commit, and push
+a matching tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow then creates a draft release with all the packages and `SHA256SUMS.txt`; review
+it and publish it from the Releases page. A tag that does not match the version fails the
+release job.
 
 ### Tests
 
