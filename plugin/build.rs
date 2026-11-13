@@ -10,6 +10,13 @@
 //! by the distribution's OBS and Qt development packages. Optional overrides:
 //! - OBS_INCLUDE_DIR / OBS_LIB_DIR: OBS headers (the folder with obs-module.h) and libraries.
 //! - OBS_QT_DIR: Qt 6 directory with include/ and lib/.
+//!
+//! macOS: libobs and Qt 6 are frameworks. plugin/package-macos.sh prepares them the way
+//! the original plugin's buildspec does (libobs and obs-frontend-api built from the OBS
+//! sources, Qt from obs-deps) and sets:
+//! - OBS_DEPS_DIR: install prefix of libobs/obs-frontend-api (default ../../obs-multi-rtmp/.deps).
+//! - OBS_QT_DIR: Qt 6 directory with lib/*.framework
+//!   (default <OBS_DEPS_DIR>/obs-deps-qt6-2026-10-23-universal).
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +29,9 @@ struct Deps {
     qt_include: Vec<PathBuf>,
     lib_dirs: Vec<PathBuf>,
     libs: Vec<String>,
+    /// macOS: framework search directories and frameworks.
+    framework_dirs: Vec<PathBuf>,
+    frameworks: Vec<String>,
 }
 
 impl Deps {
@@ -59,6 +69,67 @@ fn windows_deps(manifest: &Path) -> Deps {
     assert!(obs_include.join("obs-module.h").exists(), "OBS headers not found in {}", obs_include.display());
     let mut d = Deps { obs_include: vec![obs_include], qt_include: qt_dir_includes(&qt), ..Default::default() };
     d.link(&[deps.join("lib"), qt.join("lib")], &["obs", "obs-frontend-api", "Qt6Core", "Qt6Gui", "Qt6Widgets"]);
+    d
+}
+
+/// First of `candidates` that exists.
+fn first_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn macos_deps(manifest: &Path) -> Deps {
+    let deps = env::var("OBS_DEPS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| manifest.join("../../obs-multi-rtmp/.deps"));
+    let qt = env::var("OBS_QT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| deps.join("obs-deps-qt6-2026-10-23-universal"));
+    let mut d = Deps::default();
+
+    // libobs: a framework (OBS installs it under Frameworks/ or lib/).
+    let libobs = first_existing(["Frameworks", "lib", "."].map(|dir| deps.join(dir).join("libobs.framework")))
+        .unwrap_or_else(|| panic!("libobs.framework not found in {}", deps.display()));
+    let fw_dir = libobs.parent().unwrap().to_path_buf();
+    // Headers: in the framework, or installed separately under include/.
+    for dir in [deps.join("include/obs"), deps.join("include"), libobs.join("Headers")] {
+        if dir.join("obs-module.h").exists() || dir.join("obs-frontend-api.h").exists() {
+            d.obs_include.push(dir);
+        }
+    }
+    for header in ["obs-module.h", "obs-frontend-api.h"] {
+        assert!(d.obs_include.iter().any(|dir| dir.join(header).exists()), "{header} not found in {}", deps.display());
+    }
+    d.framework_dirs.push(fw_dir.clone());
+    d.frameworks.push("libobs".into());
+
+    // obs-frontend-api: a plain dylib or a framework, depending on the OBS version.
+    if let Some(fw) = first_existing([fw_dir.join("obs-frontend-api.framework")]) {
+        d.framework_dirs.push(fw.parent().unwrap().to_path_buf());
+        d.frameworks.push("obs-frontend-api".into());
+    } else {
+        let dylib = first_existing(["lib", "Frameworks", "bin"].map(|dir| deps.join(dir).join("obs-frontend-api.dylib")))
+            .or_else(|| first_existing(["lib", "Frameworks"].map(|dir| deps.join(dir).join("libobs-frontend-api.dylib"))))
+            .unwrap_or_else(|| panic!("obs-frontend-api not found in {}", deps.display()));
+        let name = dylib.file_stem().unwrap().to_str().unwrap().trim_start_matches("lib").to_string();
+        // A dylib without the lib prefix cannot be linked with -l; pass it by path.
+        if dylib.file_name().unwrap().to_str().unwrap().starts_with("lib") {
+            d.link(&[dylib.parent().unwrap().to_path_buf()], &[&name]);
+        } else {
+            println!("cargo:rustc-cdylib-link-arg={}", dylib.display());
+        }
+    }
+
+    // Qt 6 frameworks from obs-deps.
+    let qt_lib = qt.join("lib");
+    assert!(qt_lib.join("QtWidgets.framework").exists(), "Qt 6 frameworks not found in {}", qt_lib.display());
+    for m in ["QtCore", "QtGui", "QtWidgets"] {
+        d.qt_include.push(qt_lib.join(format!("{m}.framework/Headers")));
+        d.frameworks.push(m.into());
+    }
+    d.framework_dirs.push(qt_lib);
+
+    // At run time the frameworks come from OBS.app/Contents/Frameworks.
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
     d
 }
 
@@ -105,8 +176,11 @@ fn pkg_config_deps() -> Deps {
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let windows = env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows";
-    let deps = if windows { windows_deps(&manifest) } else { pkg_config_deps() };
+    let deps = match env::var("CARGO_CFG_TARGET_OS").unwrap().as_str() {
+        "windows" => windows_deps(&manifest),
+        "macos" => macos_deps(&manifest),
+        _ => pkg_config_deps(),
+    };
 
     let mut b = cc::Build::new();
     b.cpp(true).std("c++17").define("QT_NO_KEYWORDS", None);
@@ -125,6 +199,10 @@ fn main() {
     for dir in deps.obs_include.iter().chain(&deps.qt_include) {
         b.include(dir);
     }
+    // Qt headers include each other as <QtCore/...>, resolved through the framework path.
+    for dir in &deps.framework_dirs {
+        b.flag(format!("-F{}", dir.display()));
+    }
     for f in std::fs::read_dir(manifest.join("native")).unwrap() {
         let path = f.unwrap().path();
         if path.extension().is_some_and(|e| e == "cpp") {
@@ -141,6 +219,12 @@ fn main() {
     }
     for lib in &deps.libs {
         println!("cargo:rustc-link-lib=dylib={lib}");
+    }
+    for dir in &deps.framework_dirs {
+        println!("cargo:rustc-link-search=framework={}", dir.display());
+    }
+    for fw in &deps.frameworks {
+        println!("cargo:rustc-link-lib=framework={fw}");
     }
 
     for var in ["OBS_DEPS_DIR", "OBS_QT_DIR", "OBS_INCLUDE_DIR", "OBS_LIB_DIR"] {

@@ -48,7 +48,7 @@ New in this reimplementation:
 
 ## Requirements
 
-- Windows 10/11 x64, or Linux x86_64
+- Windows 10/11 x64, Linux x86_64, or macOS 12 or newer (Apple Silicon or Intel)
 - OBS Studio 33 or newer (64-bit)
 
 On Linux the plugin must be built from source (see [Building on Linux](#building-on-linux)).
@@ -85,6 +85,17 @@ previously installed DLL.
 `data/locale/`), keeping a copy of the previously installed library. Alternatively, extract
 the `obs-multi-rtmp-rust-<version>-linux-x86_64.tar.gz` archive made by `plugin/package.sh`
 into `~/.config/obs-studio/plugins`.
+
+**macOS:** run `obs-multi-rtmp-rust-<version>-macos-universal.pkg`. It installs
+`obs-multi-rtmp.plugin` for the current user in
+`~/Library/Application Support/obs-studio/plugins`. The installer is not signed by Apple,
+so macOS blocks it the first time: open **System Settings → Privacy & Security** and click
+**Open Anyway**, then run it again. Alternatively, extract the `.zip` into that folder and
+remove the quarantine flag, otherwise macOS refuses to load the plugin:
+
+```bash
+xattr -r -d com.apple.quarantine ~/Library/Application\ Support/obs-studio/plugins/obs-multi-rtmp.plugin
+```
 
 ## Building
 
@@ -131,6 +142,30 @@ cargo build --release -p obs-multi-rtmp
 The library is produced as `target/release/libobs_multi_rtmp.so`; install it renamed to
 `obs-multi-rtmp.so`, or use `plugin/install.sh`.
 
+### Building on macOS
+
+Prerequisites: Xcode, CMake and Rust. `bash plugin/package-macos.sh` prepares the OBS
+development files the way the original plugin does (downloads the OBS sources, obs-deps and
+Qt 6 for macOS into `.deps-macos/` and builds libobs and obs-frontend-api), builds the plugin
+for Apple Silicon and Intel, and writes a universal `.pkg` and `.zip` to `dist/`.
+
+The `macOS` GitHub Actions workflow runs the same script on every push and
+uploads the packages as a build artifact.
+
+Without further setup the plugin gets an ad-hoc signature and the installer is unsigned.
+To sign and notarize with an Apple Developer account, set these repository secrets (the
+same names as the original plugin's workflow):
+
+| Secret | Contents |
+|---|---|
+| `MACOS_SIGNING_CERT` | Base64 of a `.p12` with the Developer ID Application and Installer certificates |
+| `MACOS_SIGNING_CERT_PASSWORD` | Password of the `.p12` |
+| `MACOS_SIGNING_APPLICATION_IDENTITY` | `Developer ID Application: <name> (<team id>)` |
+| `MACOS_SIGNING_INSTALLER_IDENTITY` | `Developer ID Installer: <name> (<team id>)` |
+| `MACOS_NOTARIZATION_USERNAME` | Apple ID used for notarization |
+| `MACOS_NOTARIZATION_PASSWORD` | App-specific password of that Apple ID |
+| `MACOS_NOTARIZATION_TEAM_ID` | Team ID |
+
 ### Packaging
 
 `plugin/package.ps1` builds the release DLL and writes to `dist/`, like the original
@@ -142,6 +177,8 @@ plugin's packaging script:
 - `obs-multi-rtmp-rust-<version>-windows-x64-pdb.zip` — debug symbols
 
 On Linux, `bash plugin/package.sh` writes `dist/obs-multi-rtmp-rust-<version>-linux-x86_64.tar.gz`.
+On macOS, `bash plugin/package-macos.sh` writes `obs-multi-rtmp-rust-<version>-macos-universal.pkg`
+and `.zip`.
 
 ### Tests
 
