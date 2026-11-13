@@ -1,0 +1,181 @@
+# Builds and packages the plugin for Windows, Linux and macOS and runs the tests.
+# Pushing a tag vX.Y.Z (matching the version in plugin/Cargo.toml) also creates a
+# draft GitHub release with every package attached; publish it from the Releases page.
+#
+# macOS signing and notarization run only when the MACOS_* secrets are configured;
+# otherwise the plugin is ad-hoc signed and the installer is unsigned.
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache OBS dependencies
+        uses: actions/cache@v6
+        with:
+          path: .deps-windows
+          key: windows-deps-${{ hashFiles('plugin/setup-deps-windows.ps1') }}
+
+      - name: Prepare OBS dependencies
+        run: bash .github/scripts/logged.sh "OBS dependencies" pwsh -NoProfile -File plugin/setup-deps-windows.ps1
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis -y --no-progress
+          }
+
+      - name: Build and package
+        run: |
+          bash .github/scripts/logged.sh "Build and package" pwsh -NoProfile -File plugin/package.ps1
+          ls dist/*-windows-x64-Installer.exe dist/*-windows-x64.zip dist/*-windows-x64-pdb.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: dist/*-windows-x64*
+          if-no-files-found: error
+
+      - name: Engine tests
+        run: bash .github/scripts/logged.sh "Engine tests" cargo test --release -p obs-rtmp-sessions
+
+  linux:
+    # OBS 33 is packaged for Ubuntu 26.04 in the OBS PPA (24.04 only gets OBS 32).
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq software-properties-common curl ca-certificates git \
+            build-essential pkg-config qt6-base-dev libsimde-dev >/dev/null
+          add-apt-repository -y ppa:obsproject/obs-studio >/dev/null
+          apt-get install -y -qq obs-studio >/dev/null
+          dpkg -l obs-studio | tail -n 1
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v7
+
+      - name: Build and package
+        run: bash .github/scripts/logged.sh "Build and package" bash plugin/package.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64
+          path: dist/*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+      - name: Tests
+        run: bash .github/scripts/logged.sh "Tests" cargo test --release --workspace
+
+  macos:
+    # OBS 33 requires the macOS 26.5 SDK (Xcode 26.5) to build libobs.
+    runs-on: macos-26
+    env:
+      HAVE_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT != '' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache OBS dependencies
+        uses: actions/cache@v6
+        with:
+          path: .deps-macos
+          key: macos-deps-${{ hashFiles('plugin/package-macos.sh') }}
+
+      - name: Import signing certificates
+        if: env.HAVE_SIGNING_CERT == 'true'
+        env:
+          MACOS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$MACOS_SIGNING_CERT" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$MACOS_SIGNING_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+      - name: Build and package
+        env:
+          CODESIGN_IDENT: ${{ secrets.MACOS_SIGNING_APPLICATION_IDENTITY }}
+          CODESIGN_IDENT_INSTALLER: ${{ secrets.MACOS_SIGNING_INSTALLER_IDENTITY }}
+          NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
+          NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+        run: bash .github/scripts/logged.sh "Build and package" bash plugin/package-macos.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-universal
+          path: |
+            dist/*-macos-universal.pkg
+            dist/*-macos-universal.zip
+          if-no-files-found: error
+
+      - name: Engine tests
+        run: bash .github/scripts/logged.sh "Engine tests" cargo test --release -p obs-rtmp-sessions
+
+      - name: Remove signing keychain
+        if: always() && env.HAVE_SIGNING_CERT == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the plugin version
+        run: |
+          version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' plugin/Cargo.toml | head -n1)"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error title=Version mismatch::tag $GITHUB_REF_NAME, plugin/Cargo.toml $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" * --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "obs-multi-rtmp (Rust) $VERSION" --generate-notes

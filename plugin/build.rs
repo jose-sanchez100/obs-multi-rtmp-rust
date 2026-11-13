@@ -59,14 +59,19 @@ fn qt_dir_includes(qt: &Path) -> Vec<PathBuf> {
 }
 
 fn windows_deps(manifest: &Path) -> Deps {
-    let deps = env::var("OBS_DEPS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| manifest.join("../../obs-multi-rtmp/.deps"));
+    // Default: .deps-windows from plugin/setup-deps-windows.ps1, else the original
+    // plugin's .deps next to this repository.
+    let deps = env::var("OBS_DEPS_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        let local = manifest.join("../.deps-windows");
+        if local.exists() { local } else { manifest.join("../../obs-multi-rtmp/.deps") }
+    });
     let qt = env::var("OBS_QT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| deps.join("obs-deps-qt6-2026-10-23-x64"));
-    let obs_include = deps.join("include");
-    assert!(obs_include.join("obs-module.h").exists(), "OBS headers not found in {}", obs_include.display());
+    let obs_include = [deps.join("include"), deps.join("include/obs")]
+        .into_iter()
+        .find(|dir| dir.join("obs-module.h").exists())
+        .unwrap_or_else(|| panic!("OBS headers not found in {}", deps.join("include").display()));
     let mut d = Deps { obs_include: vec![obs_include], qt_include: qt_dir_includes(&qt), ..Default::default() };
     d.link(&[deps.join("lib"), qt.join("lib")], &["obs", "obs-frontend-api", "Qt6Core", "Qt6Gui", "Qt6Widgets"]);
     d
