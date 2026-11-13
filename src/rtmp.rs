@@ -35,6 +35,9 @@ pub struct NetOptions {
     pub family: IpFamily,
     /// Local IP the connection goes out from; None = chosen by the OS.
     pub bind_ip: Option<IpAddr>,
+    /// Socket send buffer size (SO_SNDBUF) in bytes; None = OS default (autotuned).
+    /// Data in the kernel buffer is invisible to the queue's congestion handling.
+    pub send_buffer: Option<usize>,
 }
 
 impl NetOptions {
@@ -213,11 +216,16 @@ impl RtmpTransport {
     }
 
     fn connect_tcp(&self, addr: &SocketAddr) -> io::Result<TcpStream> {
-        let Some(ip) = self.net.bind_ip else {
+        if self.net.bind_ip.is_none() && self.net.send_buffer.is_none() {
             return TcpStream::connect_timeout(addr, self.connect_timeout);
-        };
+        }
         let sock = Socket::new(Domain::for_address(*addr), Type::STREAM, Some(Protocol::TCP))?;
-        sock.bind(&SocketAddr::new(ip, 0).into()).map_err(|e| at_stage(&format!("bind IP {ip}"), e))?;
+        if let Some(size) = self.net.send_buffer {
+            sock.set_send_buffer_size(size)?;
+        }
+        if let Some(ip) = self.net.bind_ip {
+            sock.bind(&SocketAddr::new(ip, 0).into()).map_err(|e| at_stage(&format!("bind IP {ip}"), e))?;
+        }
         sock.connect_timeout(&(*addr).into(), self.connect_timeout)?;
         Ok(sock.into())
     }

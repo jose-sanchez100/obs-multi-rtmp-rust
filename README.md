@@ -48,8 +48,12 @@ New in this reimplementation:
 
 ## Requirements
 
-- Windows 10/11 x64
+- Windows 10/11 x64, or Linux x86_64
 - OBS Studio 33 or newer (64-bit)
+
+On Linux the plugin must be built from source (see [Building on Linux](#building-on-linux)).
+The Flatpak version of OBS cannot load plugins installed this way; use OBS from your
+distribution or the official PPA.
 
 ## Installation
 
@@ -76,6 +80,12 @@ Remove any copy in `C:\ProgramData\obs-studio\plugins\obs-multi-rtmp` so only on
 `plugin/install.ps1` builds the plugin and performs these steps, keeping a copy of the
 previously installed DLL.
 
+**Linux:** `bash plugin/install.sh` builds the plugin and installs it for the current user in
+`~/.config/obs-studio/plugins/obs-multi-rtmp` (`bin/64bit/obs-multi-rtmp.so` and
+`data/locale/`), keeping a copy of the previously installed library. Alternatively, extract
+the `obs-multi-rtmp-rust-<version>-linux-x86_64.tar.gz` archive made by `plugin/package.sh`
+into `~/.config/obs-studio/plugins`.
+
 ## Building
 
 Prerequisites:
@@ -99,6 +109,28 @@ cargo build --release -p obs-multi-rtmp
 The DLL is produced as `target/release/obs_multi_rtmp.dll`; install it renamed to
 `obs-multi-rtmp.dll`.
 
+### Building on Linux
+
+Prerequisites: Rust (stable), a C++17 compiler, `pkg-config`, the OBS 33 and Qt 6
+development files, and SIMDe (the OBS headers include it). `plugin/build.rs` finds OBS and
+Qt with pkg-config (`libobs` and `Qt6Widgets`). On Ubuntu 26.04, with OBS from the official
+PPA (which also installs the OBS headers; the PPA has only OBS 32 for Ubuntu 24.04):
+
+```bash
+sudo add-apt-repository ppa:obsproject/obs-studio
+sudo apt install obs-studio qt6-base-dev libsimde-dev build-essential pkg-config
+```
+
+If the files are somewhere pkg-config cannot find, set `OBS_INCLUDE_DIR` (the folder with
+`obs-module.h`), `OBS_LIB_DIR` and `OBS_QT_DIR` (a Qt 6 folder with `include/` and `lib/`).
+
+```bash
+cargo build --release -p obs-multi-rtmp
+```
+
+The library is produced as `target/release/libobs_multi_rtmp.so`; install it renamed to
+`obs-multi-rtmp.so`, or use `plugin/install.sh`.
+
 ### Packaging
 
 `plugin/package.ps1` builds the release DLL and writes to `dist/`, like the original
@@ -109,13 +141,15 @@ plugin's packaging script:
   requires [NSIS](https://nsis.sourceforge.io) (`makensis.exe`), otherwise it is skipped
 - `obs-multi-rtmp-rust-<version>-windows-x64-pdb.zip` — debug symbols
 
+On Linux, `bash plugin/package.sh` writes `dist/obs-multi-rtmp-rust-<version>-linux-x86_64.tar.gz`.
+
 ### Tests
 
 ```bash
 cargo test -p obs-rtmp-sessions
 ```
 
-The plugin tests load OBS libraries, so add the OBS `bin\64bit` folder to `PATH` first:
+The plugin tests load OBS libraries. On Windows, add the OBS `bin\64bit` folder to `PATH` first:
 
 ```powershell
 $env:PATH = "C:\Program Files\obs-studio\bin\64bit;$env:PATH"

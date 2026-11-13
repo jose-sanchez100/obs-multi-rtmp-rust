@@ -223,7 +223,7 @@ unsafe fn net_options(settings: *mut sys::obs_data_t, prefix: Prefix) -> NetOpti
         "" | "default" => None,
         ip => ip.parse().map_err(|_| crate::warn!("rust output: invalid bind IP '{ip}', using default")).ok(),
     };
-    NetOptions { family, bind_ip }
+    NetOptions { family, bind_ip, ..Default::default() }
 }
 
 unsafe fn encoder_bitrate(encoder: *mut sys::obs_encoder_t) -> u32 {

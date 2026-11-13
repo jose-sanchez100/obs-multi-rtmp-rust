@@ -2,7 +2,7 @@
 //! same bytes with the same timestamps; under asymmetric congestion the slow stream
 //! may only LOSE packets (and resume at a keyframe), never diverge.
 use bytes::Bytes;
-use obs_rtmp_sessions::rtmp::{RtmpTransport, RtmpUrl};
+use obs_rtmp_sessions::rtmp::{NetOptions, RtmpTransport, RtmpUrl};
 use obs_rtmp_sessions::session::SessionConfig;
 use obs_rtmp_sessions::{Kind, MediaPacket, QueueLimits, SessionManager};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -14,9 +14,26 @@ use std::time::{Duration, Instant};
 
 type Capture = Arc<Mutex<Vec<(Kind, u32, Vec<u8>)>>>;
 
+/// Kernel socket buffer size for the throttled link, on both ends. Loopback buffers
+/// are autotuned (up to tens of MB on Linux) and would absorb the whole backlog,
+/// hiding the congestion from the sender's queue; a congested real link keeps them small.
+const THROTTLED_SOCKET_BUFFER: usize = 32 * 1024;
+
+fn listen(throttled: bool) -> TcpListener {
+    use socket2::{Domain, Socket, Type};
+    let s = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    if throttled {
+        // Before listen(), so accepted sockets inherit it and the window scale matches.
+        s.set_recv_buffer_size(THROTTLED_SOCKET_BUFFER).unwrap();
+    }
+    s.bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap().into()).unwrap();
+    s.listen(4).unwrap();
+    s.into()
+}
+
 /// `throttle`: Some(bytes per 10 ms) to simulate a throttled link.
 fn spawn_server(throttle: Option<usize>) -> (u16, Capture, std::thread::JoinHandle<()>) {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let l = listen(throttle.is_some());
     let port = l.local_addr().unwrap().port();
     let cap: Capture = Arc::new(Mutex::new(Vec::new()));
     let c2 = cap.clone();
@@ -102,9 +119,13 @@ fn run(throttle_b: Option<usize>) -> (Vec<(Kind, u32, Vec<u8>)>, Vec<(Kind, u32,
         ..Default::default()
     };
     let mut ids = Vec::new();
-    for port in [pa, pb] {
+    for (port, throttled) in [(pa, false), (pb, throttle_b.is_some())] {
         let url = RtmpUrl::parse(&format!("rtmp://127.0.0.1:{port}/live2"), Some("key")).unwrap();
-        ids.push(mgr.add(cfg.clone(), Box::new(move || Box::new(RtmpTransport::new(url.clone())))));
+        let net = NetOptions { send_buffer: throttled.then_some(THROTTLED_SOCKET_BUFFER), ..Default::default() };
+        ids.push(mgr.add(
+            cfg.clone(),
+            Box::new(move || Box::new(RtmpTransport::new(url.clone()).with_net(net.clone()))),
+        ));
     }
     // identical headers for both
     let mut hv = video(0, true);

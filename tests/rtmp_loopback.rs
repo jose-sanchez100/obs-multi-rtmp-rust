@@ -162,19 +162,19 @@ fn binds_local_ip_and_filters_family() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || serve(listener, tx, None));
     let url = RtmpUrl::parse(&format!("rtmp://127.0.0.1:{port}/live"), Some("k")).unwrap();
-    let net = NetOptions { family: IpFamily::Any, bind_ip: Some("127.0.0.1".parse().unwrap()) };
+    let net = NetOptions { family: IpFamily::Any, bind_ip: Some("127.0.0.1".parse().unwrap()), ..Default::default() };
     let mut t = RtmpTransport::new(url.clone()).with_net(net);
     t.connect().expect("connect with bind IP");
     assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap().1, "k");
     t.close();
 
     // IPv6 only against a server that only has IPv4: clear error, no connection.
-    let net = NetOptions { family: IpFamily::V6, bind_ip: None };
+    let net = NetOptions { family: IpFamily::V6, bind_ip: None, ..Default::default() };
     let err = RtmpTransport::new(url.clone()).with_net(net).connect().unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
 
     // An IPv6 local IP forces IPv6 even if the family says "both" (like OBS).
-    let net = NetOptions { family: IpFamily::Any, bind_ip: Some("::1".parse().unwrap()) };
+    let net = NetOptions { family: IpFamily::Any, bind_ip: Some("::1".parse().unwrap()), ..Default::default() };
     let err = RtmpTransport::new(url).with_net(net).connect().unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
 }
