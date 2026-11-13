@@ -1,0 +1,6 @@
+/target/
+/backup-plugin-original-2024-12/
+*.flv
+*.h264
+*.aac
+/install-backups/

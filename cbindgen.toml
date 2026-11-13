@@ -1,0 +1,9 @@
+language = "C"
+include_guard = "OBS_RTMP_SESSIONS_H"
+pragma_once = true
+no_includes = false
+sys_includes = ["stdint.h", "stddef.h"]
+[export]
+include = ["OmrStats"]
+[parse]
+parse_deps = false

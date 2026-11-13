@@ -1,0 +1,24 @@
+[package]
+name = "obs-rtmp-sessions"
+version = "0.1.0"
+edition = "2021"
+description = "Independent RTMP/RTMPS session manager with congestion isolation for obs-multi-rtmp"
+license = "GPL-2.0-or-later"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+bytes = "1"
+rml_rtmp = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+socket2 = "0.5"
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[workspace]
+members = [".", "plugin"]
+resolver = "2"
