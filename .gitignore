@@ -4,3 +4,4 @@
 *.h264
 *.aac
 /install-backups/
+/dist/

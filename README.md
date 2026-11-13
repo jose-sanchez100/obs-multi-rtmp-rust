@@ -54,7 +54,19 @@ New in this reimplementation:
 ## Installation
 
 This plugin replaces the original obs-multi-rtmp (same DLL name and same configuration file).
-Close OBS, uninstall or remove the original plugin, then copy the build output:
+Close OBS before installing or removing it.
+
+**Installer:** run `obs-multi-rtmp-rust-<version>-windows-x64-Installer.exe`. It installs to
+`C:\ProgramData\obs-studio\plugins\obs-multi-rtmp`, replacing the original plugin if present.
+Running it again offers to update or remove the plugin; removing it keeps your targets,
+which live in the OBS profile (`obs-multi-rtmp.json`).
+
+**Zip:** extract `obs-multi-rtmp-rust-<version>-windows-x64.zip` into the OBS installation
+folder (for example `C:\Program Files\obs-studio`, or a portable OBS). It contains
+`obs-plugins/64bit/obs-multi-rtmp.dll` and `data/obs-plugins/obs-multi-rtmp/locale/`.
+Remove any copy in `C:\ProgramData\obs-studio\plugins\obs-multi-rtmp` so only one is loaded.
+
+**Manual:** copy the build output:
 
 | File | Destination |
 |---|---|
@@ -86,6 +98,16 @@ cargo build --release -p obs-multi-rtmp
 
 The DLL is produced as `target/release/obs_multi_rtmp.dll`; install it renamed to
 `obs-multi-rtmp.dll`.
+
+### Packaging
+
+`plugin/package.ps1` builds the release DLL and writes to `dist/`, like the original
+plugin's packaging script:
+
+- `obs-multi-rtmp-rust-<version>-windows-x64.zip` — OBS install-folder layout
+- `obs-multi-rtmp-rust-<version>-windows-x64-Installer.exe` — NSIS installer (`installer.nsi`);
+  requires [NSIS](https://nsis.sourceforge.io) (`makensis.exe`), otherwise it is skipped
+- `obs-multi-rtmp-rust-<version>-windows-x64-pdb.zip` — debug symbols
 
 ### Tests
 
