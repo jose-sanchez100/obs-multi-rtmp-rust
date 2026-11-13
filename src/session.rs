@@ -266,34 +266,23 @@ impl Worker {
                 Ok(()) if self.interrupted() => {} // pause or restart during connect
                 Ok(()) => {
                     // First connection: the queue already starts with headers + IDR, keep it.
-                    // Reconnect: old data is useless; resume at the next IDR after the headers.
-                    let headers = if first && !manual {
-                        Vec::new()
-                    } else {
+                    // Reconnect: old data is useless; restart at the next IDR, which the
+                    // queue precedes with the headers stamped with its timestamp.
+                    if !first || manual {
                         if !manual {
                             self.sh.reconnects.fetch_add(1, Ordering::Relaxed);
                         }
-                        self.sh.queue.reset_for_reconnect()
-                    };
+                        self.sh.queue.reset_for_reconnect();
+                    }
                     first = false;
                     manual = false;
-                    let mut ok = true;
-                    for h in &headers {
-                        if let Err(e) = t.send(h) {
-                            self.fail(&e);
-                            ok = false;
-                            break;
-                        }
-                    }
-                    if ok {
-                        self.set(SessionState::Live);
-                        let started = Instant::now();
-                        self.pump(&mut *t);
-                        // A stable session resets the backoff.
-                        if started.elapsed() > Duration::from_secs(20) {
-                            backoff = self.cfg.backoff_min;
-                            retries = 0;
-                        }
+                    self.set(SessionState::Live);
+                    let started = Instant::now();
+                    self.pump(&mut *t);
+                    // A stable session resets the backoff.
+                    if started.elapsed() > Duration::from_secs(20) {
+                        backoff = self.cfg.backoff_min;
+                        retries = 0;
                     }
                 }
                 Err(e) => self.fail(&e),

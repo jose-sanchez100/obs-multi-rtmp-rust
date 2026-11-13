@@ -56,14 +56,19 @@ fn feed(mgr: &SessionManager, dts: &mut u32, n: u32) {
     std::thread::sleep(Duration::from_millis(150));
 }
 
-/// After index `from`, the first things sent must be headers, then an IDR.
+/// After index `from`, the first things sent must be headers, then an IDR, all with
+/// the IDR's timestamp; timestamps never go backwards after that (a jump from 0 to
+/// the current stream time is rejected by YouTube as "faster than real time").
 fn assert_rejoins_at_keyframe(log: &Log, from: usize) {
     let sent = log.sent.lock().unwrap();
     let tail = &sent[from..];
     assert!(tail.len() >= 3, "nothing sent after resuming: {tail:?}");
     assert!(tail[0].1 && tail[1].1, "headers missing on resume: {:?}", &tail[..3]);
-    let first_video = tail.iter().find(|p| p.0 == Kind::Video && !p.1).unwrap();
-    assert!(first_video.2, "resumed on a P-frame: {first_video:?}");
+    let first_video = tail[2];
+    assert!(first_video.0 == Kind::Video && first_video.2 && !first_video.1, "did not resume on an IDR: {:?}", &tail[..3]);
+    assert!(first_video.3 > 0, "test must resume mid-stream");
+    assert!(tail[0].3 == first_video.3 && tail[1].3 == first_video.3, "headers not stamped with the IDR time: {:?}", &tail[..3]);
+    assert!(tail.windows(2).all(|w| w[1].3 >= w[0].3), "timestamps went backwards after resuming");
 }
 
 #[test]

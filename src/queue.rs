@@ -63,6 +63,13 @@ struct Inner {
     headers: [Option<MediaPacket>; 2],
     /// While true, P/B-frames are dropped until a keyframe is seen.
     waiting_keyframe: bool,
+    /// A new connection (reconnect, resume, late join) must start with the
+    /// sequence headers followed by a keyframe. Until that keyframe arrives,
+    /// all media is discarded; when it does, the headers are queued with the
+    /// keyframe's timestamp. Sending them with their original timestamp (0)
+    /// would make the media clock jump from 0 to the current stream time in an
+    /// instant, which ingests such as YouTube reject as "faster than real time".
+    resync: bool,
     /// dts of the most recently queued packet (excluding headers).
     newest_dts: u32,
     stats: DropStats,
@@ -86,6 +93,7 @@ impl PacketQueue {
                 bytes: 0,
                 headers: [None, None],
                 waiting_keyframe: false,
+                resync: false,
                 newest_dts: 0,
                 stats: DropStats::default(),
                 closed: false,
@@ -109,6 +117,22 @@ impl PacketQueue {
         }
         if g.paused {
             return true;
+        }
+
+        // New connection: discard everything until a keyframe, then queue the
+        // headers stamped with that keyframe's timestamp, then the keyframe.
+        if g.resync {
+            if pkt.is_header || pkt.kind != Kind::Video || !pkt.keyframe {
+                return true; // headers are already stored above
+            }
+            g.resync = false;
+            g.waiting_keyframe = false;
+            let stamped: Vec<_> =
+                g.headers.iter().flatten().map(|h| MediaPacket { dts_ms: pkt.dts_ms, ..h.clone() }).collect();
+            for h in stamped {
+                g.bytes += h.data.len();
+                g.q.push_back(h);
+            }
         }
 
         // Dropping until the next IDR.
@@ -268,30 +292,33 @@ impl PacketQueue {
         }
     }
 
-    /// For sessions that join while the stream is running: do not send P-frames
-    /// until the first keyframe.
+    /// For sessions that join while the stream is running: start at the next
+    /// keyframe, preceded by the headers stamped with its timestamp.
     pub fn wait_for_keyframe(&self) {
-        self.inner.lock().unwrap().waiting_keyframe = true;
+        let mut g = self.inner.lock().unwrap();
+        g.waiting_keyframe = true;
+        g.resync = true;
     }
 
-    /// On reconnect: flush and restart from the next keyframe, returning
-    /// the sequence headers that must be resent first.
-    pub fn reset_for_reconnect(&self) -> Vec<MediaPacket> {
+    /// On reconnect: flush and restart at the next keyframe, preceded by the
+    /// sequence headers stamped with its timestamp.
+    pub fn reset_for_reconnect(&self) {
         let mut g = self.inner.lock().unwrap();
         g.q.clear();
         g.bytes = 0;
         g.waiting_keyframe = true;
-        g.headers.iter().flatten().cloned().collect()
+        g.resync = true;
     }
 
-    /// Pause: flushes the queue and stops queueing media. On resume, waits for the
-    /// next keyframe (headers are resent on reconnect).
+    /// Pause: flushes the queue and stops queueing media. On resume, restarts at
+    /// the next keyframe (see `reset_for_reconnect`).
     pub fn set_paused(&self, paused: bool) {
         let mut g = self.inner.lock().unwrap();
         g.paused = paused;
         g.q.clear();
         g.bytes = 0;
         g.waiting_keyframe = true;
+        g.resync = true;
     }
 
     pub fn stats(&self) -> (DropStats, usize) {
@@ -347,8 +374,68 @@ mod tests {
         }
         let (_, bytes) = q.stats();
         assert!(bytes <= 1000, "bytes={bytes}");
-        let hdrs = q.reset_for_reconnect();
-        assert_eq!(hdrs.len(), 1);
+    }
+
+    fn vh() -> MediaPacket {
+        MediaPacket { is_header: true, ..v(0, true, 20) }
+    }
+    fn ah() -> MediaPacket {
+        MediaPacket { is_header: true, ..a(0, 4) }
+    }
+    fn drain(q: &PacketQueue) -> Vec<MediaPacket> {
+        std::iter::from_fn(|| q.pop_timeout(Duration::from_millis(1))).collect()
+    }
+
+    /// After a reconnect the stream restarts with the headers stamped with the
+    /// first keyframe's timestamp (never 0), then that keyframe; audio and
+    /// P-frames that arrive before it are discarded.
+    #[test]
+    fn reconnect_stamps_headers_with_keyframe_time() {
+        let q = PacketQueue::new(QueueLimits { soft_bytes: 1 << 30, hard_bytes: 1 << 30, max_latency_ms: 0 });
+        q.push(vh());
+        q.push(ah());
+        for f in 0..90u32 {
+            q.push(v(f * 33, f % 60 == 0, 100));
+            q.push(a(f * 33, 10));
+        }
+        drain(&q);
+
+        q.reset_for_reconnect();
+        q.push(a(1_200_000, 10));
+        q.push(v(1_200_010, false, 100));
+        q.push(v(1_200_043, true, 100));
+        q.push(a(1_200_050, 10));
+        let out = drain(&q);
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert!(out[0].is_header && out[0].kind == Kind::Video && out[0].dts_ms == 1_200_043);
+        assert!(out[1].is_header && out[1].kind == Kind::Audio && out[1].dts_ms == 1_200_043);
+        assert!(out[2].keyframe && !out[2].is_header && out[2].dts_ms == 1_200_043);
+        assert_eq!(out[3].dts_ms, 1_200_050);
+    }
+
+    /// Same for a session that joins a running stream and for pause/resume.
+    #[test]
+    fn late_join_and_resume_never_send_timestamp_zero_headers() {
+        for resume in [false, true] {
+            let q = PacketQueue::new(QueueLimits::default());
+            if resume {
+                q.push(vh());
+                q.push(ah());
+                q.set_paused(true);
+                q.push(v(5000, true, 100));
+                q.set_paused(false);
+            } else {
+                q.wait_for_keyframe();
+                q.push(vh());
+                q.push(ah());
+            }
+            q.push(v(60_000, false, 100));
+            q.push(v(60_033, true, 100));
+            let out = drain(&q);
+            assert_eq!(out.len(), 3, "resume={resume} {out:?}");
+            assert!(out.iter().all(|p| p.dts_ms == 60_033), "resume={resume} {out:?}");
+            assert!(out[0].is_header && out[1].is_header && out[2].keyframe);
+        }
     }
 
     #[test]
