@@ -2,38 +2,53 @@
 //! same bytes with the same timestamps; under asymmetric congestion the slow stream
 //! may only LOSE packets (and resume at a keyframe), never diverge.
 use bytes::Bytes;
-use obs_rtmp_sessions::rtmp::{NetOptions, RtmpTransport, RtmpUrl};
+use obs_rtmp_sessions::rtmp::{RtmpTransport, RtmpUrl};
 use obs_rtmp_sessions::session::SessionConfig;
-use obs_rtmp_sessions::{Kind, MediaPacket, QueueLimits, SessionManager};
+use obs_rtmp_sessions::{Kind, MediaPacket, QueueLimits, SessionManager, Transport};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 type Capture = Arc<Mutex<Vec<(Kind, u32, Vec<u8>)>>>;
 
-/// Kernel socket buffer size for the throttled link, on both ends. Loopback buffers
-/// are autotuned (up to tens of MB on Linux) and would absorb the whole backlog,
-/// hiding the congestion from the sender's queue; a congested real link keeps them small.
-const THROTTLED_SOCKET_BUFFER: usize = 32 * 1024;
-
-fn listen(throttled: bool) -> TcpListener {
-    use socket2::{Domain, Socket, Type};
-    let s = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    if throttled {
-        // Before listen(), so accepted sockets inherit it and the window scale matches.
-        s.set_recv_buffer_size(THROTTLED_SOCKET_BUFFER).unwrap();
-    }
-    s.bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap().into()).unwrap();
-    s.listen(4).unwrap();
-    s.into()
+/// Simulates a congested link by pacing the real RTMP transport to a fixed rate.
+/// Throttling the receiving socket instead is not portable: loopback kernel buffers
+/// (autotuned to megabytes on Linux and macOS) absorb the backlog and hide it from the
+/// sender's queue.
+struct Paced {
+    inner: RtmpTransport,
+    bytes_per_sec: f64,
+    start: Instant,
+    sent: u64,
 }
 
-/// `throttle`: Some(bytes per 10 ms) to simulate a throttled link.
-fn spawn_server(throttle: Option<usize>) -> (u16, Capture, std::thread::JoinHandle<()>) {
-    let l = listen(throttle.is_some());
+impl Transport for Paced {
+    fn connect(&mut self) -> io::Result<()> {
+        self.inner.connect()?;
+        self.start = Instant::now();
+        self.sent = 0;
+        Ok(())
+    }
+    fn send(&mut self, pkt: &MediaPacket) -> io::Result<()> {
+        self.inner.send(pkt)?;
+        self.sent += pkt.data.len() as u64;
+        let due = Duration::from_secs_f64(self.sent as f64 / self.bytes_per_sec);
+        std::thread::sleep(due.saturating_sub(self.start.elapsed()));
+        Ok(())
+    }
+    fn poll(&mut self) -> io::Result<()> {
+        self.inner.poll()
+    }
+    fn close(&mut self) {
+        self.inner.close()
+    }
+}
+
+fn spawn_server() -> (u16, Capture, std::thread::JoinHandle<()>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let cap: Capture = Arc::new(Mutex::new(Vec::new()));
     let c2 = cap.clone();
@@ -83,16 +98,12 @@ fn spawn_server(throttle: Option<usize>) -> (u16, Capture, std::thread::JoinHand
             process(&mut sess, &mut s, r);
         }
         loop {
-            let want = throttle.map(|t| t.min(buf.len())).unwrap_or(buf.len());
-            match s.read(&mut buf[..want]) {
+            match s.read(&mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
                     let r = sess.handle_input(&buf[..n]).unwrap();
                     process(&mut sess, &mut s, r);
                 }
-            }
-            if throttle.is_some() {
-                std::thread::sleep(Duration::from_millis(10));
             }
         }
     });
@@ -110,21 +121,27 @@ fn audio(dts: u32) -> MediaPacket {
     MediaPacket { kind: Kind::Audio, dts_ms: dts, keyframe: false, is_header: false, data: Bytes::from(vec![(dts % 251) as u8; 300]) }
 }
 
-fn run(throttle_b: Option<usize>) -> (Vec<(Kind, u32, Vec<u8>)>, Vec<(Kind, u32, Vec<u8>)>, u64) {
-    let (pa, ca, ha) = spawn_server(None);
-    let (pb, cb, hb) = spawn_server(throttle_b);
+/// `throttle_b`: Some(bytes per second) to pace the backup stream.
+fn run(throttle_b: Option<f64>) -> (Vec<(Kind, u32, Vec<u8>)>, Vec<(Kind, u32, Vec<u8>)>, u64) {
+    let (pa, ca, ha) = spawn_server();
+    let (pb, cb, hb) = spawn_server();
     let mgr = SessionManager::new();
     let cfg = SessionConfig {
         limits: QueueLimits { soft_bytes: 1 << 30, hard_bytes: 1 << 30, max_latency_ms: 1500 },
         ..Default::default()
     };
     let mut ids = Vec::new();
-    for (port, throttled) in [(pa, false), (pb, throttle_b.is_some())] {
+    for (port, rate) in [(pa, None), (pb, throttle_b)] {
         let url = RtmpUrl::parse(&format!("rtmp://127.0.0.1:{port}/live2"), Some("key")).unwrap();
-        let net = NetOptions { send_buffer: throttled.then_some(THROTTLED_SOCKET_BUFFER), ..Default::default() };
         ids.push(mgr.add(
             cfg.clone(),
-            Box::new(move || Box::new(RtmpTransport::new(url.clone()).with_net(net.clone()))),
+            Box::new(move || -> Box<dyn Transport> {
+                let inner = RtmpTransport::new(url.clone());
+                match rate {
+                    Some(bytes_per_sec) => Box::new(Paced { inner, bytes_per_sec, start: Instant::now(), sent: 0 }),
+                    None => Box::new(inner),
+                }
+            }),
         ));
     }
     // identical headers for both
@@ -177,7 +194,7 @@ fn both_streams_identical_without_congestion() {
 #[test]
 fn congested_backup_is_a_strict_subset_of_primary() {
     // ~30 KB/s versus ~90 KB/s of media: sustained congestion
-    let (a, b, dropped_b) = run(Some(300));
+    let (a, b, dropped_b) = run(Some(30_000.0));
     println!("primary={} packets, backup={} packets, video frames dropped on backup={dropped_b}", a.len(), b.len());
 
     // the primary receives everything
