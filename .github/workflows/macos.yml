@@ -15,7 +15,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    # OBS 33 requires the macOS 26.5 SDK (Xcode 26.5) to build libobs.
+    runs-on: macos-26
     env:
       HAVE_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT != '' }}
     steps:
