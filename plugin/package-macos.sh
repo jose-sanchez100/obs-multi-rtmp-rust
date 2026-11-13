@@ -77,6 +77,15 @@ setup_deps() {
 echo "OBS development files:"
 find "$deps/Frameworks" "$deps/lib" "$deps/include" -maxdepth 2 \( -name '*.framework' -o -name '*.dylib' -o -name 'obs-module.h' -o -name 'obs-frontend-api.h' \) 2>/dev/null || true
 
+# The OBS headers include SIMDe (header-only). Use the copy in obs-deps when present.
+if [ -z "${SIMDE_INCLUDE_DIR:-}" ] && ! ls "$deps"/*/include/simde/x86/sse2.h >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1; then
+        brew list simde >/dev/null 2>&1 || brew install simde
+        export SIMDE_INCLUDE_DIR="$(brew --prefix)/include"
+    fi
+fi
+echo "SIMDe: $(ls "$deps"/*/include/simde/x86/sse2.h 2>/dev/null || echo "${SIMDE_INCLUDE_DIR:-not found}")"
+
 export OBS_DEPS_DIR="$deps" OBS_QT_DIR="$qt" MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
 targets=(aarch64-apple-darwin x86_64-apple-darwin)
 rustup target add "${targets[@]}"

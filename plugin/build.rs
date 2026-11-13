@@ -102,6 +102,18 @@ fn macos_deps(manifest: &Path) -> Deps {
     d.framework_dirs.push(fw_dir.clone());
     d.frameworks.push("libobs".into());
 
+    // The OBS headers include SIMDe: from obs-deps, SIMDE_INCLUDE_DIR or Homebrew.
+    let mut simde_dirs: Vec<PathBuf> = env::var("SIMDE_INCLUDE_DIR").map(PathBuf::from).into_iter().collect();
+    if let Ok(entries) = std::fs::read_dir(&deps) {
+        simde_dirs.extend(entries.flatten().map(|e| e.path().join("include")));
+    }
+    simde_dirs.extend(["/opt/homebrew/include", "/usr/local/include"].map(PathBuf::from));
+    let simde = simde_dirs
+        .into_iter()
+        .find(|dir| dir.join("simde/x86/sse2.h").exists())
+        .unwrap_or_else(|| panic!("SIMDe headers not found (obs-deps in {}, SIMDE_INCLUDE_DIR or Homebrew)", deps.display()));
+    d.obs_include.push(simde);
+
     // obs-frontend-api: a plain dylib or a framework, depending on the OBS version.
     if let Some(fw) = first_existing([fw_dir.join("obs-frontend-api.framework")]) {
         d.framework_dirs.push(fw.parent().unwrap().to_path_buf());
