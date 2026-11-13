@@ -66,6 +66,21 @@ jobs:
       - name: Engine tests
         run: cargo test --release -p obs-rtmp-sessions
 
+      # Summary of the package as an annotation (readable without signing in).
+      - name: Inspect package
+        run: |
+          bin=target/package-macos/obs-multi-rtmp.plugin/Contents/MacOS/obs-multi-rtmp
+          {
+            lipo -info "$bin"
+            otool -L "$bin" | grep -E 'rpath|obs|Qt'
+            otool -l "$bin" | grep -A2 LC_RPATH | grep path
+            codesign -dv "$bin" 2>&1 | grep -E 'Signature|Identifier|Format'
+            pkgutil --payload-files dist/*-macos-universal.pkg | grep -E 'MacOS|Info.plist|es-ES'
+            ls -l dist
+          } > "$RUNNER_TEMP/inspect.txt" 2>&1
+          cat "$RUNNER_TEMP/inspect.txt"
+          echo "::notice title=macOS package::$(sed 's/%/%25/g' "$RUNNER_TEMP/inspect.txt" | awk 'BEGIN{ORS="%0A"} {print}')"
+
       - uses: actions/upload-artifact@v4
         with:
           name: obs-multi-rtmp-rust-macos-universal
