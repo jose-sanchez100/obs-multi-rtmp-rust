@@ -18,7 +18,7 @@ stage="$stage_root/obs-multi-rtmp"
 
 rm -rf "$stage_root"
 mkdir -p "$stage/bin/64bit" "$stage/data/locale" "$dist"
-rm -f "$dist"/obs-multi-rtmp-rust-*-linux-x86_64*
+rm -f "$dist/$name"*  # other versions in dist/ are kept
 install -m 755 "$root/target/release/libobs_multi_rtmp.so" "$stage/bin/64bit/obs-multi-rtmp.so"
 install -m 644 "$here"/data/locale/*.ini "$stage/data/locale/"
 

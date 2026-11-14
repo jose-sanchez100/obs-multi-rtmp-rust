@@ -24,7 +24,8 @@ $target = Join-Path $root "target\release"
 # Staging tree = the layout under %ALLUSERSPROFILE%\obs-studio\plugins\obs-multi-rtmp.
 if (Test-Path $stageRoot) { Remove-Item $stageRoot -Recurse -Force }
 New-Item -ItemType Directory -Force $dist | Out-Null
-Remove-Item (Join-Path $dist "obs-multi-rtmp-rust-*-windows-x64*") -ErrorAction SilentlyContinue
+# Only this version's packages are replaced; other versions in dist/ are kept.
+Remove-Item (Join-Path $dist "$name*") -ErrorAction SilentlyContinue
 $bin = Join-Path $stage "bin\64bit"
 $locale = Join-Path $stage "data\locale"
 New-Item -ItemType Directory -Force $bin, $locale | Out-Null
