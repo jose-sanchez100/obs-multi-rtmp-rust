@@ -1,6 +1,6 @@
 [package]
 name = "obs-multi-rtmp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "OBS plugin for streaming to multiple destinations; logic in Rust, minimal Qt dock"
 license = "GPL-2.0-or-later"
