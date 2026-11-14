@@ -273,6 +273,7 @@ version = "0.2.0"
 dependencies = [
  "cc",
  "if-addrs",
+ "log",
  "obs-rtmp-sessions",
  "pkg-config",
  "serde",
@@ -285,11 +286,13 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "env_logger",
+ "libc",
  "log",
  "rml_rtmp",
  "rustls",
  "socket2",
  "webpki-roots 0.26.11",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

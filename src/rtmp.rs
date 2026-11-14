@@ -4,7 +4,8 @@
 //! i.e. what OBS's `flv-mux.c` already produces for rtmp-stream.
 
 use crate::queue::{Kind, MediaPacket};
-use crate::session::Transport;
+use crate::session::{ConnectionInfo, Transport};
+use crate::tcpinfo::{self, TcpStats};
 use bytes::Bytes;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
@@ -160,6 +161,7 @@ pub struct RtmpTransport {
     stream: Option<Stream>,
     session: Option<ClientSession>,
     last_drain: Instant,
+    info: Option<ConnectionInfo>,
 }
 
 fn other<E: std::fmt::Debug>(e: E) -> io::Error {
@@ -196,6 +198,7 @@ impl RtmpTransport {
             stream: None,
             session: None,
             last_drain: Instant::now(),
+            info: None,
         }
     }
 
@@ -317,6 +320,11 @@ impl RtmpTransport {
 impl Transport for RtmpTransport {
     fn connect(&mut self) -> io::Result<()> {
         let mut stream = self.open_stream()?;
+        let sock = stream.sock();
+        self.info = match (sock.peer_addr(), sock.local_addr()) {
+            (Ok(remote), Ok(local)) => Some(ConnectionInfo { host: self.url.host.clone(), remote, local }),
+            _ => None,
+        };
         let leftover = Self::handshake(&mut stream).map_err(|e| at_stage("RTMP handshake", e))?;
 
         let mut conf = ClientSessionConfig::new();
@@ -444,6 +452,14 @@ impl Transport for RtmpTransport {
             let _ = s.sock().shutdown(std::net::Shutdown::Both);
         }
         self.session = None;
+    }
+
+    fn connection_info(&self) -> Option<ConnectionInfo> {
+        self.info.clone()
+    }
+
+    fn tcp_stats(&self) -> Option<TcpStats> {
+        self.stream.as_ref().and_then(|s| tcpinfo::read(s.sock()))
     }
 }
 

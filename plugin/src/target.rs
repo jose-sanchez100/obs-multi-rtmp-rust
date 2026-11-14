@@ -287,6 +287,15 @@ fn slot_info(s: &obs_rtmp_sessions::SessionSnapshot, live_since: Option<Instant>
     if s.drops.dropped_video_frames != 0 {
         parts.push(format!("drop {}", s.drops.dropped_video_frames));
     }
+    if s.state == SessionState::Live {
+        // Dropping now (last 10 s), and TCP retransmissions: a lossy path.
+        if s.recent_drop_pct >= 5.0 {
+            parts.push(format!("dropping {:.0}%", s.recent_drop_pct));
+        }
+        if let Some(r) = s.retrans_pct.filter(|r| *r >= 1.0) {
+            parts.push(format!("retx {r:.1}%"));
+        }
+    }
     // A queue of more than half a megabyte means this target is falling behind.
     if s.queued_bytes >= 512 * 1024 {
         parts.push(format!("queue {:.1} MB", s.queued_bytes as f64 / (1024.0 * 1024.0)));
@@ -297,6 +306,33 @@ fn slot_info(s: &obs_rtmp_sessions::SessionSnapshot, live_since: Option<Instant>
         }
     }
     parts.join(" · ")
+}
+
+/// Tooltip of a stream row: where the connection went and how it is doing.
+fn slot_tooltip(s: &obs_rtmp_sessions::SessionSnapshot) -> String {
+    let mut lines = Vec::new();
+    if let Some(c) = &s.connection {
+        lines.push(format!("Ingest: {} ({})", c.host, c.remote));
+        lines.push(format!("Local: {}", c.local));
+    }
+    if s.state == SessionState::Live {
+        let mut net = Vec::new();
+        if let Some(rtt) = s.rtt_ms {
+            net.push(format!("RTT {rtt:.0} ms"));
+        }
+        if let Some(r) = s.retrans_pct {
+            net.push(format!("retransmitted {r:.1}%"));
+        }
+        net.push(format!("dropped {:.0}% (last 10 s)", s.recent_drop_pct));
+        lines.push(net.join(", "));
+    }
+    if s.reconnects != 0 {
+        lines.push(format!("Reconnects: {} ({} because of congestion)", s.reconnects, s.congestion_reconnects));
+    }
+    if let Some(e) = s.last_error.as_deref().filter(|e| !e.is_empty()) {
+        lines.push(e.to_owned());
+    }
+    lines.join("\n")
 }
 
 fn slot_color(s: SessionState) -> &'static str {
@@ -418,6 +454,9 @@ impl Runtime {
         let (oid, oname) = (c(proto.output_id), c("multi-output"));
         let out = unsafe { Output::from_owned(sys::obs_output_create(oid.as_ptr(), oname.as_ptr(), data_ptr(&settings), std::ptr::null_mut())) }
             .ok_or_else(|| fail("Error.CreateRtmpService"))?;
+        if t.protocol == "RTMP_RUST" {
+            rust_output::set_label(out.as_ptr(), &t.name);
+        }
         self.generation = GENERATION.fetch_add(1, Ordering::Relaxed);
         let ctx = Box::new(SignalCtx { target_id: self.id.clone(), generation: self.generation });
         let sh = unsafe { sys::obs_output_get_signal_handler(out.as_ptr()) };
@@ -667,13 +706,12 @@ impl Runtime {
         } else {
             String::new()
         };
-        let error = s.last_error.clone().unwrap_or_default();
         json!({
             "paused": s.state == SessionState::Paused,
             "dot": slot_color(s.state),
             "bitrate": bitrate,
             "info": slot_info(s, self.slot_live_since[i].filter(|_| measured)),
-            "tooltip": error,
+            "tooltip": slot_tooltip(s),
         })
     }
 

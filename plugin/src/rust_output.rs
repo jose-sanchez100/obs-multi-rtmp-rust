@@ -8,8 +8,9 @@
 //! has no server, those keys are read from the output settings (unmigrated
 //! version 0.2.0 config).
 //!
-//! Output settings: per-stream engine options (drop threshold, IP family,
-//! local IP, buffer, retries), like rtmp_output's but for Live and Backup.
+//! Output settings: per-stream engine options (drop threshold, reconnect on
+//! congestion, IP family, local IP, buffer, retries), like rtmp_output's but
+//! for Live and Backup.
 use crate::module::obs_module_text;
 use crate::obs::{c, cstr, sys};
 use obs_rtmp_sessions::ffi::{add_rtmp_session_with, OmrStreamInfo};
@@ -19,6 +20,7 @@ pub use obs_rtmp_sessions::SessionState;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const OUTPUT_ID: &std::ffi::CStr = c"multi_rtmp_rust_output";
@@ -43,11 +45,18 @@ pub struct Status {
     pub backup: Option<obs_rtmp_sessions::SessionSnapshot>,
 }
 
+/// Advanced menu option: lets streams reconnect on sustained congestion, after
+/// the time set per stream in the target's Output settings. Off by default.
+static CONGESTION_RECONNECT: AtomicBool = AtomicBool::new(false);
+
 #[derive(Default)]
 struct Engine {
     mgr: Option<Arc<SessionManager>>,
     primary: u64,
     backup: u64,
+    /// Reconnect-on-congestion windows of the Live and Backup streams, from the
+    /// output settings; applied only while CONGESTION_RECONNECT is on.
+    congestion_window: [Duration; 2],
     origin_us: Option<i64>,
     headers_sent: bool,
     running: bool,
@@ -57,6 +66,8 @@ struct Ctx {
     output: *mut sys::obs_output_t,
     /// Guards the manager during capture, stop and stats reads.
     engine: Mutex<Engine>,
+    /// Target name, for the sessions' log messages.
+    label: Mutex<String>,
 }
 
 // The OBS pointer is only used as an identity and in thread-safe libobs calls.
@@ -101,7 +112,7 @@ unsafe extern "C" fn get_name(_: *mut c_void) -> *const c_char {
 }
 
 unsafe extern "C" fn create(_: *mut sys::obs_data_t, output: *mut sys::obs_output_t) -> *mut c_void {
-    let ctx = Arc::new(Ctx { output, engine: Mutex::new(Engine::default()) });
+    let ctx = Arc::new(Ctx { output, engine: Mutex::new(Engine::default()), label: Mutex::new(String::new()) });
     registry().lock().unwrap().insert(output as usize, ctx.clone());
     Arc::into_raw(ctx) as *mut c_void
 }
@@ -119,6 +130,8 @@ const DEF_DROP_THRESHOLD_MS: i64 = 4000;
 const DEF_BUFFER_MB: i64 = 2;
 const DEF_RETRY_MAX_S: i64 = 30;
 const DEF_MAX_RETRIES: i64 = 0;
+/// Seconds of sustained drops before reconnecting (0 = never).
+const DEF_CONGESTION_RECONNECT_S: i64 = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Prefix {
@@ -154,6 +167,15 @@ unsafe extern "C" fn get_properties(_: *mut c_void) -> *mut sys::obs_properties_
         let header = if prefix == Prefix::Live { c"RustOutput.Live" } else { c"RustOutput.Backup" };
         sys::obs_properties_add_text(p, prefix.key("header").as_ptr(), t(header), sys::OBS_TEXT_INFO);
         sys::obs_properties_add_int(p, prefix.key("drop_threshold_ms").as_ptr(), t(c"RustOutput.DropThreshold"), 0, 30000, 100);
+        let congestion = sys::obs_properties_add_int(
+            p,
+            prefix.key("congestion_reconnect_s").as_ptr(),
+            t(c"RustOutput.CongestionReconnect"),
+            0,
+            600,
+            5,
+        );
+        sys::obs_property_set_long_description(congestion, t(c"RustOutput.CongestionReconnect.Tooltip"));
 
         let fam = sys::obs_properties_add_list(
             p,
@@ -193,6 +215,7 @@ unsafe extern "C" fn get_defaults(settings: *mut sys::obs_data_t) {
         sys::obs_data_set_default_int(settings, prefix.key("buffer_mb").as_ptr(), DEF_BUFFER_MB);
         sys::obs_data_set_default_int(settings, prefix.key("retry_max_s").as_ptr(), DEF_RETRY_MAX_S);
         sys::obs_data_set_default_int(settings, prefix.key("max_retries").as_ptr(), DEF_MAX_RETRIES);
+        sys::obs_data_set_default_int(settings, prefix.key("congestion_reconnect_s").as_ptr(), DEF_CONGESTION_RECONNECT_S);
     }
 }
 
@@ -208,6 +231,7 @@ unsafe fn session_config(settings: *mut sys::obs_data_t, prefix: Prefix) -> Sess
     cfg.backoff_max = Duration::from_secs(int("retry_max_s", 1, 300) as u64);
     cfg.backoff_min = cfg.backoff_min.min(cfg.backoff_max);
     cfg.max_retries = int("max_retries", 0, 1000) as u32;
+    cfg.congestion_window = Duration::from_secs(int("congestion_reconnect_s", 0, 600) as u64);
     cfg
 }
 
@@ -277,7 +301,20 @@ unsafe extern "C" fn start(data: *mut c_void) -> bool {
     let key = setting(dest, c"key");
     let burl = setting(dest, c"backup_server");
     let mut bkey = setting(dest, c"backup_key");
-    let opts = Prefix::ALL.map(|p| (session_config(settings, p), net_options(settings, p)));
+    let label = ctx.label.lock().unwrap().clone();
+    let opts = Prefix::ALL.map(|p| {
+        let mut cfg = session_config(settings, p);
+        let slot = if p == Prefix::Live { "Live" } else { "Backup" };
+        cfg.label = if label.is_empty() { slot.to_owned() } else { format!("{label} / {slot}") };
+        (cfg, net_options(settings, p))
+    });
+    let congestion_window = opts.each_ref().map(|(cfg, _)| cfg.congestion_window);
+    let mut opts = opts;
+    if !CONGESTION_RECONNECT.load(Ordering::Relaxed) {
+        for (cfg, _) in &mut opts {
+            cfg.congestion_window = Duration::ZERO;
+        }
+    }
     if !svc_settings.is_null() {
         sys::obs_data_release(svc_settings);
     }
@@ -314,7 +351,15 @@ unsafe extern "C" fn start(data: *mut c_void) -> bool {
                 }
             }
         }
-        *e = Engine { mgr: Some(mgr), primary, backup, origin_us: None, headers_sent: false, running: true };
+        *e = Engine {
+            mgr: Some(mgr),
+            primary,
+            backup,
+            congestion_window,
+            origin_us: None,
+            headers_sent: false,
+            running: true,
+        };
     }
 
     if !sys::obs_output_begin_data_capture(out, 0) {
@@ -422,6 +467,36 @@ unsafe extern "C" fn get_dropped_frames(data: *mut c_void) -> c_int {
     primary_snapshot(data).map(|s| s.drops.dropped_video_frames as c_int).unwrap_or(0)
 }
 
+pub fn congestion_reconnect() -> bool {
+    CONGESTION_RECONNECT.load(Ordering::Relaxed)
+}
+
+/// Turns reconnect on congestion on or off for every Rust output, including
+/// the streams that are live now.
+pub fn set_congestion_reconnect(enabled: bool) {
+    if CONGESTION_RECONNECT.swap(enabled, Ordering::Relaxed) == enabled {
+        return;
+    }
+    crate::info!("rust output: reconnect on congestion {}", if enabled { "enabled" } else { "disabled" });
+    let contexts: Vec<Arc<Ctx>> = registry().lock().unwrap().values().cloned().collect();
+    for ctx in contexts {
+        let e = ctx.engine.lock().unwrap();
+        let Some(mgr) = e.mgr.as_ref().filter(|_| e.running) else { continue };
+        for (id, window) in [(e.primary, e.congestion_window[0]), (e.backup, e.congestion_window[1])] {
+            if id != 0 {
+                mgr.set_congestion_window(id, if enabled { window } else { Duration::ZERO });
+            }
+        }
+    }
+}
+
+/// Names the output's sessions in the log (the target name). Call before starting.
+pub fn set_label(output: *mut sys::obs_output_t, label: &str) {
+    if let Some(ctx) = find(output) {
+        *ctx.label.lock().unwrap() = label.to_owned();
+    }
+}
+
 /// None if the output is not of this type or is not streaming.
 pub fn status(output: *mut sys::obs_output_t) -> Option<Status> {
     let ctx = find(output)?;
@@ -445,12 +520,7 @@ pub fn control(output: *mut sys::obs_output_t, slot: Slot, action: Action) -> bo
         Action::Resume => mgr.resume(id),
         Action::Restart => mgr.restart(id),
     };
-    crate::info!(
-        "rust output {}: {:?} session ({:?})",
-        cstr(unsafe { sys::obs_output_get_name(output) }),
-        slot,
-        action
-    );
+    crate::info!("rust output: {} / {:?}: {:?} requested by the user", ctx.label.lock().unwrap(), slot, action);
     ok
 }
 

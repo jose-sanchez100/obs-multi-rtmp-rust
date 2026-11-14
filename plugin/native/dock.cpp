@@ -446,6 +446,12 @@ public:
         nullStream_->setEnabled(false); // until FINISHED_LOADING
         QObject::connect(nullStream_, &QAction::triggered,
                          [](bool checked) { Command({{"cmd", "null_stream"}, {"enabled", checked}}); });
+        congestionReconnect_ = menu->addAction(T("CongestionReconnect"));
+        congestionReconnect_->setToolTip(T("CongestionReconnect.Tooltip"));
+        congestionReconnect_->setCheckable(true);
+        congestionReconnect_->setEnabled(false); // until FINISHED_LOADING
+        QObject::connect(congestionReconnect_, &QAction::triggered,
+                         [](bool checked) { Command({{"cmd", "congestion_reconnect"}, {"enabled", checked}}); });
         advanced_->setMenu(menu);
         bar->addWidget(advanced_);
         headerLayout->addLayout(bar);
@@ -522,6 +528,12 @@ public:
             nullStream_->setChecked(nullActive);
         }
         nullStream_->setEnabled(Bool(ns, "enabled"));
+        const auto& cr = m.contains("congestion_reconnect") ? m["congestion_reconnect"] : json();
+        {
+            QSignalBlocker block(congestionReconnect_);
+            congestionReconnect_->setChecked(Bool(cr, "checked"));
+        }
+        congestionReconnect_->setEnabled(Bool(cr, "enabled"));
         // When the null output is active the button shows it, since the option is hidden in the menu.
         auto advText = QString::fromUtf8(nullActive ? "⚙ ⊘" : "⚙");
         if (advanced_->text() != advText) {
@@ -554,6 +566,7 @@ private:
     QWidget* container_ = nullptr;
     QToolButton* advanced_ = nullptr;
     QAction* nullStream_ = nullptr;
+    QAction* congestionReconnect_ = nullptr;
     OutputsList* list_ = nullptr;
     QTimer timer_;
     bool refreshPending_ = false;

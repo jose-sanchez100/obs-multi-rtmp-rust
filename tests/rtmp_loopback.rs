@@ -125,7 +125,18 @@ fn publishes_to_local_rtmp_server() {
     }
     assert_eq!(got.iter().map(|g| (g.0.as_str(), g.2)).collect::<Vec<_>>(),
         vec![("video", 5000), ("audio", 300), ("video", 1200)]);
+
+    // Where the connection went, and the kernel's TCP statistics for it.
+    let info = t.connection_info().expect("connection info");
+    assert_eq!(info.host, "127.0.0.1");
+    assert_eq!(info.remote, format!("127.0.0.1:{port}").parse().unwrap());
+    assert!(info.local.ip().is_loopback() && info.local.port() != 0);
+    if cfg!(any(windows, target_os = "linux", target_os = "macos")) {
+        let tcp = t.tcp_stats().expect("TCP statistics");
+        assert!(tcp.sent > 0 && tcp.retransmitted <= tcp.sent, "{tcp:?}");
+    }
     t.close();
+    assert!(t.tcp_stats().is_none());
 }
 
 #[test]
