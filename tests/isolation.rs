@@ -60,26 +60,31 @@ fn slow_destination_does_not_affect_producer_or_healthy_destination() {
     }));
     std::thread::sleep(Duration::from_millis(200));
 
-    // 10 simulated seconds of 30 fps + audio, pumped as fast as possible.
-    let t0 = Instant::now();
+    // 10 simulated seconds of 30 fps + audio, pumped as fast as possible. Only the
+    // time spent inside push_all counts: the short pauses that let the workers run
+    // can last several ms each on CI runners (macOS) and say nothing about blocking.
+    let mut push_time = Duration::ZERO;
     let mut produced = 0u64;
     for frame in 0..300u32 {
         let dts = frame * 33;
+        let t0 = Instant::now();
         mgr.push_all(&video(dts, frame % 30 == 0));
         mgr.push_all(&audio(dts));
+        push_time += t0.elapsed();
         produced += 2;
         if frame % 3 == 0 {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    let push_time = t0.elapsed();
     std::thread::sleep(Duration::from_millis(800));
 
     let f = mgr.snapshot(fast).unwrap();
     let s = mgr.snapshot(slow).unwrap();
     println!("producer: {produced} pkts in {push_time:?}\nfast: {f:?}\nslow: {s:?}");
 
-    assert!(push_time < Duration::from_millis(900), "producer blocked: {push_time:?}");
+    // A send to the slow destination takes 40 ms: blocking on it even a few times
+    // would show up here.
+    assert!(push_time < Duration::from_millis(300), "producer blocked: {push_time:?}");
     assert_eq!(f.packets_sent, produced, "healthy destination lost packets");
     assert_eq!(f.video_frames_sent, 300, "per-destination video frame count");
     assert!(s.video_frames_sent < 300);
