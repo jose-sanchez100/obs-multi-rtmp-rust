@@ -59,24 +59,63 @@ pub fn read(sock: &TcpStream) -> Option<TcpStats> {
     })
 }
 
+/// `struct tcp_connection_info` from XNU's bsd/netinet/tcp.h. Not libc's: it
+/// declares the fifteen 1-bit TFO bitfields as separate u32 fields, so its struct
+/// is 120 bytes instead of 112 and the counters after them read past what the
+/// kernel fills (always 0).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[allow(dead_code)] // only some fields are read; all are needed for the layout
+struct TcpConnectionInfo {
+    state: u8,
+    snd_wscale: u8,
+    rcv_wscale: u8,
+    pad1: u8,
+    options: u32,
+    flags: u32,
+    rto: u32,
+    maxseg: u32,
+    snd_ssthresh: u32,
+    snd_cwnd: u32,
+    snd_wnd: u32,
+    snd_sbbytes: u32,
+    rcv_wnd: u32,
+    rttcur: u32,
+    /// Smoothed RTT in ms.
+    srtt: u32,
+    rttvar: u32,
+    /// The TFO bitfields.
+    tfo: u32,
+    txpackets: u64,
+    txbytes: u64,
+    txretransmitbytes: u64,
+    rxpackets: u64,
+    rxbytes: u64,
+    rxoutoforderbytes: u64,
+    txretransmitpackets: u64,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<TcpConnectionInfo>() == 112);
+
 #[cfg(target_os = "macos")]
 pub fn read(sock: &TcpStream) -> Option<TcpStats> {
     use std::os::fd::AsRawFd;
-    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    let mut info: TcpConnectionInfo = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<TcpConnectionInfo>() as libc::socklen_t;
     let rc = unsafe {
         libc::getsockopt(
             sock.as_raw_fd(),
             libc::IPPROTO_TCP,
             libc::TCP_CONNECTION_INFO,
-            &mut info as *mut libc::tcp_connection_info as *mut libc::c_void,
+            &mut info as *mut TcpConnectionInfo as *mut libc::c_void,
             &mut len,
         )
     };
     (rc == 0).then(|| TcpStats {
-        rtt_us: info.tcpi_srtt.saturating_mul(1000),
-        sent: info.tcpi_txbytes,
-        retransmitted: info.tcpi_txretransmitbytes,
+        rtt_us: info.srtt.saturating_mul(1000),
+        sent: info.txbytes,
+        retransmitted: info.txretransmitbytes,
     })
 }
 
