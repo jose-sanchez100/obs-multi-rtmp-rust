@@ -35,17 +35,17 @@ namespace {
 
 // Painted icons (not glyphs): the pause emoji renders inside a blue box and
 // glyph sizes vary with the font. This way they are crisp and use the theme color.
-enum class Glyph { Pause, Play, Restart };
+enum class Glyph { Pause, Play, Restart, Stop, Edit, Options };
 constexpr int kIconPx = 18;
 
-QIcon GlyphIcon(Glyph g, const QColor& color, qreal dpr)
+QIcon GlyphIcon(Glyph g, const QColor& color, qreal dpr, int px = kIconPx)
 {
-    QPixmap pm(QSize(kIconPx, kIconPx) * dpr);
+    QPixmap pm(QSize(px, px) * dpr);
     pm.setDevicePixelRatio(dpr);
     pm.fill(Qt::transparent);
     QPainter p(&pm);
     p.setRenderHint(QPainter::Antialiasing);
-    p.scale(kIconPx / 16.0, kIconPx / 16.0); // draw on a 16x16 grid
+    p.scale(px / 16.0, px / 16.0); // draw on a 16x16 grid
     switch (g) {
     case Glyph::Pause:
         p.setPen(Qt::NoPen);
@@ -80,6 +80,36 @@ QIcon GlyphIcon(Glyph g, const QColor& color, qreal dpr)
         p.drawPath(head);
         break;
     }
+    case Glyph::Stop:
+        p.setPen(Qt::NoPen);
+        p.setBrush(color);
+        p.drawRoundedRect(QRectF(3, 3, 10, 10), 1.5, 1.5);
+        break;
+    case Glyph::Edit: {
+        // Pencil outline.
+        p.setPen(QPen(color, 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setBrush(Qt::NoBrush);
+        QPainterPath pencil;
+        pencil.moveTo(10.5, 2.5);
+        pencil.lineTo(13.5, 5.5);
+        pencil.lineTo(5.5, 13.5);
+        pencil.lineTo(2.5, 13.5);
+        pencil.lineTo(2.5, 10.5);
+        pencil.closeSubpath();
+        p.drawPath(pencil);
+        break;
+    }
+    case Glyph::Options:
+        // Two sliders.
+        p.setPen(QPen(color, 1.5, Qt::SolidLine, Qt::RoundCap));
+        p.setBrush(Qt::NoBrush);
+        p.drawLine(QPointF(2, 4), QPointF(8.9, 4));
+        p.drawLine(QPointF(12.1, 4), QPointF(14, 4));
+        p.drawLine(QPointF(2, 12), QPointF(3.9, 12));
+        p.drawLine(QPointF(7.1, 12), QPointF(14, 12));
+        p.drawEllipse(QPointF(10.5, 4), 1.6, 1.6);
+        p.drawEllipse(QPointF(5.5, 12), 1.6, 1.6);
+        break;
     }
     return QIcon(pm);
 }
@@ -139,114 +169,313 @@ bool Bool(const json& j, const char* key)
     return it != j.end() && it->is_boolean() && it->get<bool>();
 }
 
-// ------------------------------------------------------------------ target row
+// ------------------------------------------------------------------ target card
 
+// Colors that follow the OBS theme: dark and light variants of each status tone.
+enum class Tone { Live, Warn, Error, Busy };
+
+bool IsDark(const QWidget* w)
+{
+    return w->palette().color(QPalette::Window).lightness() < 128;
+}
+
+QColor ToneFg(Tone t, bool dark)
+{
+    switch (t) {
+    case Tone::Live:
+        return QColor(dark ? "#6ee7a2" : "#11663a");
+    case Tone::Warn:
+        return QColor(dark ? "#ffd659" : "#7a5800");
+    case Tone::Error:
+        return QColor(dark ? "#ff8f86" : "#a3221b");
+    case Tone::Busy:
+        return QColor(dark ? "#9cc0ff" : "#1d4ed8");
+    }
+    return {};
+}
+
+QColor ToneBg(Tone t, bool dark)
+{
+    switch (t) {
+    case Tone::Live:
+        return QColor(dark ? "#173d29" : "#d3f5e1");
+    case Tone::Warn:
+        return QColor(dark ? "#4a3d12" : "#fff0c2");
+    case Tone::Error:
+        return QColor(dark ? "#4d1f1c" : "#fde0dd");
+    case Tone::Busy:
+        return QColor(dark ? "#1d2f57" : "#dbe6ff");
+    }
+    return {};
+}
+
+QString Rgba(const QColor& c, double alpha)
+{
+    return QString("rgba(%1, %2, %3, %4)").arg(c.red()).arg(c.green()).arg(c.blue()).arg(alpha);
+}
+
+QFont ScaledFont(QFont f, qreal factor, bool bold = false)
+{
+    if (f.pointSizeF() > 0)
+        f.setPointSizeF(f.pointSizeF() * factor);
+    else if (f.pixelSize() > 0)
+        f.setPixelSize(qRound(f.pixelSize() * factor));
+    f.setBold(bold);
+    return f;
+}
+
+void SetText(QLabel* label, const QString& text)
+{
+    if (label->text() != text)
+        label->setText(text);
+}
+
+void SetStyle(QWidget* w, const QString& style)
+{
+    if (w->styleSheet() != style)
+        w->setStyleSheet(style);
+}
+
+// Signal strength of a stream: four bars, `level` of them lit.
+class SignalBars : public QWidget {
+public:
+    explicit SignalBars(QWidget* parent) : QWidget(parent) { setFixedSize(16, 14); }
+
+    void Set(int level, const QColor& color)
+    {
+        if (level == level_ && color == color_)
+            return;
+        level_ = level;
+        color_ = color;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(Qt::NoPen);
+        QColor off = palette().color(QPalette::WindowText);
+        off.setAlphaF(0.22);
+        for (int i = 0; i < 4; ++i) {
+            const qreal h = 5 + i * 3;
+            p.setBrush(i < level_ ? color_ : off);
+            p.drawRoundedRect(QRectF(i * 4, height() - h, 3, h), 1, 1);
+        }
+    }
+
+private:
+    int level_ = 0;
+    QColor color_;
+};
+
+// Checkbox drawn the same way in every theme: a white box when off, blue with a
+// white tick when on (the theme's indicator is hard to see on the card).
+class CardCheck : public QCheckBox {
+public:
+    explicit CardCheck(QWidget* parent) : QCheckBox(parent)
+    {
+        setCursor(Qt::PointingHandCursor);
+        setFixedSize(kSize + 2, kSize + 2);
+    }
+
+    QSize sizeHint() const override { return {kSize + 2, kSize + 2}; }
+    QSize minimumSizeHint() const override { return sizeHint(); }
+
+protected:
+    bool hitButton(const QPoint& pos) const override { return rect().contains(pos); }
+
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        const QRectF box(1.5, 1.5, kSize - 1, kSize - 1);
+        const bool hover = underMouse();
+        if (isChecked()) {
+            const QColor blue(hover ? "#6a9dff" : "#4f8cff");
+            p.setPen(QPen(blue, 1));
+            p.setBrush(blue);
+            p.drawRoundedRect(box, 3, 3);
+            p.setPen(QPen(Qt::white, 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            p.setBrush(Qt::NoBrush);
+            QPainterPath tick;
+            tick.moveTo(box.left() + box.width() * 0.24, box.top() + box.height() * 0.52);
+            tick.lineTo(box.left() + box.width() * 0.43, box.top() + box.height() * 0.71);
+            tick.lineTo(box.left() + box.width() * 0.77, box.top() + box.height() * 0.32);
+            p.drawPath(tick);
+        } else {
+            p.setPen(QPen(QColor(hover ? "#4f8cff" : "#8a8f9c"), 1));
+            p.setBrush(Qt::white);
+            p.drawRoundedRect(box, 3, 3);
+        }
+    }
+
+private:
+    static constexpr int kSize = 15;
+};
+
+// One target as a card:
+//   [x] YouTube  [WARNING]                     [Stop]
+//       01:35:11 · Backup unstable
+//   ┌ ● Live    10.2 Mbps  ▂▄▆█        ⏸ ⟳ ┐
+//   │ ● Backup  8.14 Mbps  ▂▄          ⏸ ⟳ │
+//   └   retx 6.2% · RTT 106 ms · recon 3    ┘
 class TargetRow : public QWidget {
 public:
     explicit TargetRow(const std::string& id, QWidget* parent = nullptr) : QWidget(parent), id_(id)
     {
-        auto layout = new QGridLayout(this);
-        // Compact margins: the style's defaults (~9-11 px per side) spread targets too far apart.
-        layout->setContentsMargins(6, 3, 6, 3);
-        layout->setHorizontalSpacing(6);
-        layout->setVerticalSpacing(2);
+        auto outer = new QVBoxLayout(this);
+        outer->setContentsMargins(8, 4, 8, 4);
+        card_ = new QFrame(this);
+        card_->setObjectName("omrCard");
+        outer->addWidget(card_);
 
-        layout->addWidget(enabled_ = new QCheckBox(this), 0, 0);
+        auto layout = new QVBoxLayout(card_);
+        layout->setContentsMargins(10, 8, 10, 8);
+        layout->setSpacing(6);
+
+        auto header = new QHBoxLayout();
+        header->setContentsMargins(0, 0, 0, 0);
+        header->setSpacing(8);
+        header->addWidget(enabled_ = new CardCheck(card_), 0, Qt::AlignVCenter);
         enabled_->setToolTip(T("Target.Enabled"));
         QObject::connect(enabled_, &QCheckBox::clicked, [this](bool checked) {
             Command({{"cmd", "set_enabled"}, {"id", id_}, {"enabled", checked}});
         });
 
-        auto title = new QWidget(this);
-        auto titleLayout = new QHBoxLayout(title);
-        titleLayout->setContentsMargins(0, 0, 0, 0);
-        titleLayout->setSpacing(0);
-        titleLayout->addWidget(dot_ = new QLabel(QString::fromUtf8("●"), this));
-        titleLayout->addWidget(name_ = new QLabel(this));
-        // Streaming time next to the name (targets using the Rust engine).
-        titleLayout->addSpacing(8);
-        titleLayout->addWidget(clock_ = new QLabel(this));
-        clock_->hide();
-        titleLayout->addStretch(1);
-        layout->addWidget(title, 0, 1);
+        auto titles = new QVBoxLayout();
+        titles->setContentsMargins(0, 0, 0, 0);
+        titles->setSpacing(1);
+        auto nameRow = new QHBoxLayout();
+        nameRow->setContentsMargins(0, 0, 0, 0);
+        nameRow->setSpacing(8);
+        nameRow->addWidget(name_ = new QLabel(card_));
+        name_->setFont(ScaledFont(font(), 1.08, true));
+        nameRow->addWidget(badge_ = new QLabel(card_));
+        badge_->setFont(ScaledFont(font(), 0.8, true));
+        badge_->hide();
+        nameRow->addStretch(1);
+        titles->addLayout(nameRow);
+        titles->addWidget(summary_ = new QLabel(card_));
+        summary_->setFont(ScaledFont(font(), 0.92));
+        summary_->setWordWrap(true);
+        // Long texts wrap instead of widening the dock.
+        summary_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        titles->addWidget(detail_ = new QLabel(card_));
+        detail_->setFont(ScaledFont(font(), 0.92));
+        detail_->setWordWrap(true);
+        detail_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        detail_->hide();
+        header->addLayout(titles, 1);
 
-        layout->addWidget(button_ = new QPushButton(T("Btn.Start"), this), 0, 2);
+        header->addWidget(button_ = new QPushButton(T("Btn.Start"), card_), 0, Qt::AlignVCenter);
         QObject::connect(button_, &QPushButton::clicked, [this]() { Command({{"cmd", "toggle"}, {"id", id_}}); });
-        button_->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
-        button_->setMinimumHeight(button_->fontMetrics().height() + 8);
-        auto fm = button_->fontMetrics();
-        button_->setMinimumWidth((std::max)(fm.horizontalAdvance(T("Btn.Start")), fm.horizontalAdvance(T("Status.Stop"))) + 24);
-        layout->setColumnStretch(1, 1);
+        button_->setCursor(Qt::PointingHandCursor);
+        button_->setFont(ScaledFont(font(), 1.0, true));
+        auto fm = QFontMetrics(button_->font());
+        button_->setMinimumWidth((std::max)(fm.horizontalAdvance(T("Btn.Start")), fm.horizontalAdvance(T("Status.Stop"))) + 30);
+        button_->setMinimumHeight(fm.height() + 12);
+        layout->addLayout(header);
 
-        layout->addWidget(msg_ = new QLabel(this), 1, 0, 1, 3);
-        msg_->setWordWrap(true);
-        msg_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
-
-        BuildRustControls(layout);
+        BuildStreams(layout);
     }
 
     const std::string& Id() const { return id_; }
 
     void Apply(const json& m)
     {
-        name_->setText(QString::fromStdString(Str(m, "name")));
+        const bool dark = IsDark(this);
+        const QColor text = palette().color(QPalette::WindowText);
+        const QString muted = Rgba(text, 0.68);
+
+        SetText(name_, QString::fromStdString(Str(m, "name")));
         {
             QSignalBlocker block(enabled_);
             enabled_->setChecked(Bool(m, "enabled"));
         }
+
+        const auto badge = Str(m, "badge");
+        const auto badgeText = QString::fromStdString(Str(m, "badge_text"));
+        badge_->setVisible(!badgeText.isEmpty());
+        if (!badgeText.isEmpty()) {
+            const Tone tone = badge == "live" ? Tone::Live : badge == "warn" ? Tone::Warn : badge == "error" ? Tone::Error : Tone::Busy;
+            SetText(badge_, badgeText);
+            SetStyle(badge_, QString("QLabel { color: %1; background: %2; border-radius: 4px; padding: 1px 6px; }")
+                                 .arg(ToneFg(tone, dark).name(), ToneBg(tone, dark).name()));
+        }
+
+        const auto summary = QString::fromStdString(Str(m, "summary"));
+        SetText(summary_, summary);
+        summary_->setVisible(!summary.isEmpty());
+        SetStyle(summary_, QString("QLabel { color: %1; }").arg(muted));
+        summary_->setToolTip(QString::fromStdString(Str(m, "tooltip")));
+
+        const QColor errorFg = ToneFg(Tone::Error, dark);
+        const auto detail = QString::fromStdString(Str(m, "detail"));
+        SetText(detail_, detail);
+        detail_->setVisible(!detail.isEmpty());
+        SetStyle(detail_, QString("QLabel { color: %1; }").arg(errorFg.name()));
+
+        SetStyle(card_, QString("QFrame#omrCard { background: rgba(127, 127, 127, 0.10); border: 1px solid %1; border-radius: 8px; }")
+                            .arg(badge == "error" ? Rgba(errorFg, 0.45) : QStringLiteral("rgba(127, 127, 127, 0.22)")));
+        SetStyle(streams_, QString("QFrame#omrStreams { background: %1; border: none; border-radius: 6px; }")
+                               .arg(dark ? "rgba(0, 0, 0, 0.18)" : "rgba(0, 0, 0, 0.05)"));
+
         button_->setText(QString::fromStdString(Str(m, "button")));
-        auto clock = QString::fromStdString(Str(m, "clock"));
-        if (clock_->text() != clock)
-            clock_->setText(clock);
-        clock_->setVisible(!clock.isEmpty());
-        auto msg = QString::fromStdString(Str(m, "msg"));
-        if (msg_->text() != msg)
-            msg_->setText(msg);
-        msg_->setVisible(!msg.isEmpty());
-        msg_->setToolTip(QString::fromStdString(Str(m, "tooltip")));
-        auto dot = QString("color: %1;").arg(QString::fromStdString(Str(m, "dot")));
-        if (dot_->styleSheet() != dot)
-            dot_->setStyleSheet(dot);
+        if (Bool(m, "busy"))
+            SetStyle(button_, QString("QPushButton { background: transparent; color: %1; border: 1px solid %2; border-radius: 6px; padding: 4px 13px; }"
+                                      "QPushButton:hover { background: %3; }"
+                                      "QPushButton:pressed { background: %4; }")
+                                  .arg(errorFg.name(), Rgba(errorFg, 0.55), Rgba(errorFg, 0.12), Rgba(errorFg, 0.22)));
+        else
+            SetStyle(button_, "QPushButton { background: #2f5bd3; color: #ffffff; border: none; border-radius: 6px; padding: 5px 14px; }"
+                              "QPushButton:hover { background: #3a68e0; }"
+                              "QPushButton:pressed { background: #2850bd; }");
 
         const auto& rust = m.contains("rust") ? m["rust"] : json();
-        rustControls_->setVisible(rust.is_object());
-        if (rust.is_object()) {
-            const char* slots[2] = {"primary", "backup"};
-            for (int i = 0; i < 2; ++i) {
-                const auto& s = rust.contains(slots[i]) ? rust[slots[i]] : json();
-                slotBox_[i]->setVisible(s.is_object());
-                SetPaused(i, s.is_object() && Bool(s, "paused"));
-                if (s.is_object()) {
-                    auto rate = QString::fromStdString(Str(s, "bitrate"));
-                    if (slotRate_[i]->text() != rate)
-                        slotRate_[i]->setText(rate);
-                    auto color = QString("color: %1;").arg(QString::fromStdString(Str(s, "dot")));
-                    if (slotDot_[i]->styleSheet() != color)
-                        slotDot_[i]->setStyleSheet(color);
-                    auto info = QString::fromStdString(Str(s, "info"));
-                    if (slotInfo_[i]->text() != info)
-                        slotInfo_[i]->setText(info);
-                    auto tip = QString::fromStdString(Str(s, "tooltip"));
-                    slotBox_[i]->setToolTip(tip.isEmpty() ? info : tip);
-                }
-            }
+        streams_->setVisible(rust.is_object());
+        if (!rust.is_object())
+            return;
+        const QColor warnFg = ToneFg(Tone::Warn, dark);
+        const char* slots[2] = {"primary", "backup"};
+        for (int i = 0; i < 2; ++i) {
+            const auto& s = rust.contains(slots[i]) ? rust[slots[i]] : json();
+            slotBox_[i]->setVisible(s.is_object());
+            SetPaused(i, s.is_object() && Bool(s, "paused"));
+            if (!s.is_object())
+                continue;
+            SetText(slotRate_[i], QString::fromStdString(Str(s, "rate")));
+            SetStyle(slotDot_[i], QString("QLabel { background: %1; border-radius: 4px; }").arg(QString::fromStdString(Str(s, "dot"))));
+            const int health = s.contains("health") && s["health"].is_number_integer() ? s["health"].get<int>() : 0;
+            slotBars_[i]->Set(health, QColor(health >= 3 ? "#2ecc71" : health == 2 ? "#e6b800" : "#e74c3c"));
+            const auto issue = QString::fromStdString(Str(s, "issue"));
+            SetText(slotIssue_[i], issue);
+            slotIssue_[i]->setVisible(!issue.isEmpty());
+            SetStyle(slotIssue_[i], QString("QLabel { color: %1; }").arg(Bool(s, "warn") ? warnFg.name() : muted));
+            slotBox_[i]->setToolTip(QString::fromStdString(Str(s, "tooltip")));
         }
+        SetStyle(separator_, QString("QFrame { background: %1; border: none; }").arg(Rgba(text, 0.12)));
+        separator_->setVisible(slotBox_[0]->isVisibleTo(streams_) && slotBox_[1]->isVisibleTo(streams_));
     }
 
 private:
     std::string id_;
+    QFrame* card_ = nullptr;
     QCheckBox* enabled_ = nullptr;
-    QLabel* dot_ = nullptr;
     QLabel* name_ = nullptr;
-    QLabel* clock_ = nullptr;
+    QLabel* badge_ = nullptr;
+    QLabel* summary_ = nullptr;
+    QLabel* detail_ = nullptr;
     QPushButton* button_ = nullptr;
-    QLabel* msg_ = nullptr;
-    QWidget* rustControls_ = nullptr;
+    QFrame* streams_ = nullptr;
+    QFrame* separator_ = nullptr;
     QWidget* slotBox_[2] = {};
     QToolButton* pauseBtn_[2] = {};
     QLabel* slotDot_[2] = {};
     QLabel* slotRate_[2] = {};
-    QLabel* slotInfo_[2] = {};
+    SignalBars* slotBars_[2] = {};
+    QLabel* slotIssue_[2] = {};
     bool paused_[2] = {};
 
     void SetPaused(int i, bool paused)
@@ -256,30 +485,41 @@ private:
         pauseBtn_[i]->setToolTip(T(paused ? "Rust.Resume" : "Rust.Pause"));
     }
 
-    // One row per stream (Live / Backup) of a target using the Rust engine:
-    // ● Live ⏸ ⟳  6.30 Mbps  30 FPS  00:12:03 · recon 1 · drop 3
-    void BuildRustControls(QGridLayout* layout)
+    // The streams (Live / Backup) of a target using the Rust engine, in an inset panel.
+    void BuildStreams(QVBoxLayout* layout)
     {
-        rustControls_ = new QWidget(this);
-        auto rows = new QVBoxLayout(rustControls_);
-        rows->setContentsMargins(0, 0, 0, 0);
+        streams_ = new QFrame(card_);
+        streams_->setObjectName("omrStreams");
+        auto rows = new QVBoxLayout(streams_);
+        rows->setContentsMargins(8, 2, 6, 2);
         rows->setSpacing(0);
         QLabel* names[2];
         for (int i = 0; i < 2; ++i) {
             const char* slot = i == 0 ? "primary" : "backup";
-            auto box = slotBox_[i] = new QWidget(rustControls_);
-            auto row = new QHBoxLayout(box);
+            auto box = slotBox_[i] = new QWidget(streams_);
+            auto col = new QVBoxLayout(box);
+            col->setContentsMargins(0, 2, 0, 2);
+            col->setSpacing(0);
+            auto row = new QHBoxLayout();
             row->setContentsMargins(0, 0, 0, 0);
-            row->setSpacing(4);
+            row->setSpacing(8);
 
-            slotDot_[i] = new QLabel(QString::fromUtf8("●"), box);
-            slotDot_[i]->setStyleSheet("color: #888888;");
+            slotDot_[i] = new QLabel(box);
+            slotDot_[i]->setFixedSize(8, 8);
             row->addWidget(slotDot_[i]);
             auto label = T(i == 0 ? "Rust.Primary" : "Rust.Backup");
             if (label.endsWith(':'))
                 label.chop(1);
             names[i] = new QLabel(label, box);
             row->addWidget(names[i]);
+
+            // Fixed width so both rows line up in columns.
+            slotRate_[i] = new QLabel(box);
+            slotRate_[i]->setMinimumWidth(slotRate_[i]->fontMetrics().horizontalAdvance("000.0 Mbps"));
+            slotRate_[i]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            row->addWidget(slotRate_[i]);
+            row->addWidget(slotBars_[i] = new SignalBars(box));
+            row->addStretch(1);
 
             pauseBtn_[i] = FlatIconButton(box);
             SetPaused(i, false);
@@ -294,25 +534,30 @@ private:
             });
             row->addWidget(pauseBtn_[i]);
             row->addWidget(restart);
+            col->addLayout(row);
 
-            // Fixed width so both rows line up in columns.
-            slotRate_[i] = new QLabel(box);
-            slotRate_[i]->setMinimumWidth(slotRate_[i]->fontMetrics().horizontalAdvance("00.00 Mbps  60 FPS"));
-            slotRate_[i]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-            row->addWidget(slotRate_[i]);
-
-            // The connection text (which may include the error) must not widen the dock.
-            slotInfo_[i] = new QLabel(box);
-            slotInfo_[i]->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-            row->addWidget(slotInfo_[i], 1);
+            // What is wrong with this stream (or its history); wraps under the row.
+            slotIssue_[i] = new QLabel(box);
+            slotIssue_[i]->setFont(ScaledFont(font(), 0.88));
+            slotIssue_[i]->setWordWrap(true);
+            slotIssue_[i]->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+            slotIssue_[i]->setContentsMargins(16, 0, 0, 2);
+            slotIssue_[i]->hide();
+            col->addWidget(slotIssue_[i]);
             rows->addWidget(box);
+
+            if (i == 0) {
+                separator_ = new QFrame(streams_);
+                separator_->setFixedHeight(1);
+                rows->addWidget(separator_);
+            }
         }
         // Same width for "Live" and "Backup" (and their translations).
         int w = std::max(names[0]->sizeHint().width(), names[1]->sizeHint().width());
         names[0]->setMinimumWidth(w);
         names[1]->setMinimumWidth(w);
-        layout->addWidget(rustControls_, 2, 0, 1, 3);
-        rustControls_->hide();
+        layout->addWidget(streams_);
+        streams_->hide();
     }
 };
 
@@ -408,22 +653,41 @@ public:
         // with the list nor moves when targets are added.
         auto header = new QWidget(this);
         auto headerLayout = new QVBoxLayout(header);
-        headerLayout->setContentsMargins(6, 4, 6, 2);
+        headerLayout->setContentsMargins(8, 8, 8, 4);
         headerLayout->setSpacing(2);
         auto bar = new QHBoxLayout();
         bar->setContentsMargins(0, 0, 0, 0);
-        bar->setSpacing(4);
-        auto tool = [header](const char* glyph, const char* key) {
+        bar->setSpacing(6);
+        // Start all (primary, blue) and Stop all with icon and text; Edit targets and
+        // the advanced options as square icon buttons on the right.
+        const QColor fg = palette().color(QPalette::WindowText);
+        const qreal dpr = devicePixelRatioF();
+        auto textButton = [header, dpr](Glyph g, const QColor& color, const char* key, const QString& style) {
             auto b = new QToolButton(header);
-            b->setText(QString::fromUtf8(glyph) + " " + T(key));
+            b->setText(T(key));
             b->setToolTip(T(key));
-            b->setToolButtonStyle(Qt::ToolButtonTextOnly);
+            b->setIcon(GlyphIcon(g, color, dpr, 12));
+            b->setIconSize(QSize(12, 12));
+            b->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
             b->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+            b->setCursor(Qt::PointingHandCursor);
+            b->setStyleSheet(style);
             return b;
         };
-        auto startAll = tool("▶", "Btn.StartAll");
-        auto stopAll = tool("■", "Btn.StopAll");
-        auto edit = tool("✎", "Btn.EditTargets");
+        auto startAll = textButton(Glyph::Play, Qt::white, "Btn.StartAll",
+                                   "QToolButton { background: #2f5bd3; color: #ffffff; border: none; border-radius: 6px;"
+                                   " padding: 5px 10px; font-weight: bold; }"
+                                   "QToolButton:hover { background: #3a68e0; }"
+                                   "QToolButton:pressed { background: #2850bd; }");
+        auto stopAll = textButton(Glyph::Stop, fg, "Btn.StopAll",
+                                  "QToolButton { background: rgba(127, 127, 127, 0.18); border: 1px solid rgba(127, 127, 127, 0.35);"
+                                  " border-radius: 6px; padding: 4px 10px; }"
+                                  "QToolButton:hover { background: rgba(127, 127, 127, 0.30); }"
+                                  "QToolButton:pressed { background: rgba(127, 127, 127, 0.42); }");
+        auto edit = new QToolButton(header);
+        edit->setIcon(GlyphIcon(Glyph::Edit, fg, dpr, 15));
+        edit->setToolTip(T("Btn.EditTargets"));
+        edit->setStyleSheet(SquareButtonStyle(QStringLiteral("rgba(127, 127, 127, 0.35)")));
         QObject::connect(startAll, &QToolButton::clicked, []() { Command({{"cmd", "start_all"}}); });
         QObject::connect(stopAll, &QToolButton::clicked, []() { Command({{"cmd", "stop_all"}}); });
         QObject::connect(edit, &QToolButton::clicked, [this]() { EditTargets(); });
@@ -434,10 +698,14 @@ public:
 
         // Advanced options menu (next to Edit targets).
         advanced_ = new QToolButton(header);
-        advanced_->setText(QString::fromUtf8("⚙"));
         advanced_->setToolTip(T("Btn.Advanced"));
         advanced_->setPopupMode(QToolButton::InstantPopup);
-        advanced_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        for (auto btn : {edit, advanced_}) {
+            btn->setIconSize(QSize(15, 15));
+            btn->setFixedSize(30, 30);
+            btn->setCursor(Qt::PointingHandCursor);
+        }
+        SetAdvancedLook(false);
         auto menu = new QMenu(advanced_);
         menu->setToolTipsVisible(true);
         nullStream_ = menu->addAction(T("MainStreamNull"));
@@ -456,11 +724,6 @@ public:
         bar->addWidget(advanced_);
         headerLayout->addLayout(bar);
 
-        auto line = new QFrame(header);
-        line->setFrameShape(QFrame::HLine);
-        line->setFrameShadow(QFrame::Sunken);
-        headerLayout->addWidget(line);
-
         list_ = new OutputsList(container_);
         list_->setDragDropMode(QAbstractItemView::InternalMove);
         list_->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -470,20 +733,24 @@ public:
         list_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
         list_->setStyleSheet("QListWidget { padding: 0px; margin: 0px; border: none; background: transparent; }"
+                             "QListWidget::item { padding: 0px; margin: 0px; border: none; background: transparent; }"
                              "QListWidget::item:selected, QListWidget::item:active { border: none; background: transparent; }"
                              "QListWidget::item:hover, QListWidget::item:hover:selected, QListWidget::item:hover:active {"
-                             " border: none; background: rgba(127, 127, 127, 0.1); }");
+                             " border: none; background: transparent; }");
         QObject::connect(list_->model(), &QAbstractItemModel::rowsMoved, [this]() { OnRowsMoved(); });
         layout->addWidget(list_);
 
         auto credit = new QLabel(
-            QString::fromUtf8("<p>This plugin is provided for free. <br>Author: SoraYuki "
-                              "(<a href=\"https://paypal.me/sorayuki0\">donate</a>)</p>"),
+            QString::fromUtf8("This plugin is provided for free · Author: SoraYuki "
+                              "(<a href=\"https://paypal.me/sorayuki0\">donate</a>)"),
             container_);
         credit->setTextFormat(Qt::RichText);
         credit->setTextInteractionFlags(Qt::TextBrowserInteraction);
         credit->setOpenExternalLinks(true);
-        credit->setContentsMargins(6, 2, 6, 0); // aligned with the targets
+        credit->setContentsMargins(10, 4, 10, 0); // aligned with the cards
+        credit->setWordWrap(true);
+        credit->setFont(ScaledFont(credit->font(), 0.88));
+        credit->setStyleSheet(QString("QLabel { color: %1; }").arg(Rgba(palette().color(QPalette::WindowText), 0.6)));
         layout->addWidget(credit);
 
         scroll_.setWidgetResizable(true);
@@ -535,10 +802,8 @@ public:
         }
         congestionReconnect_->setEnabled(Bool(cr, "enabled"));
         // When the null output is active the button shows it, since the option is hidden in the menu.
-        auto advText = QString::fromUtf8(nullActive ? "⚙ ⊘" : "⚙");
-        if (advanced_->text() != advText) {
-            advanced_->setText(advText);
-            advanced_->setStyleSheet(nullActive ? "QToolButton { color: #e6b800; }" : "");
+        if (nullActive != advancedWarn_) {
+            SetAdvancedLook(nullActive);
             advanced_->setToolTip(nullActive ? T("Btn.Advanced") + QStringLiteral("\n") + T("MainStreamNull") : T("Btn.Advanced"));
         }
 
@@ -570,6 +835,25 @@ private:
     OutputsList* list_ = nullptr;
     QTimer timer_;
     bool refreshPending_ = false;
+    bool advancedWarn_ = false;
+
+    // Square icon button; amber while the null output is active (its option is in the menu).
+    void SetAdvancedLook(bool warn)
+    {
+        advancedWarn_ = warn;
+        const QColor color = warn ? QColor("#e6b800") : palette().color(QPalette::WindowText);
+        advanced_->setIcon(GlyphIcon(Glyph::Options, color, devicePixelRatioF(), 15));
+        advanced_->setStyleSheet(SquareButtonStyle(warn ? QStringLiteral("#e6b800") : QStringLiteral("rgba(127, 127, 127, 0.35)")));
+    }
+
+    static QString SquareButtonStyle(const QString& border)
+    {
+        return QString("QToolButton { background: transparent; border: 1px solid %1; border-radius: 6px; padding: 0px; }"
+                       "QToolButton:hover { background: rgba(127, 127, 127, 0.22); }"
+                       "QToolButton:pressed { background: rgba(127, 127, 127, 0.38); }"
+                       "QToolButton::menu-indicator { image: none; width: 0px; }")
+            .arg(border);
+    }
 
     TargetRow* RowAt(int i) const
     {
