@@ -54,6 +54,11 @@ pub struct DropStats {
     pub dropped_video_frames: u64,
     pub dropped_audio_frames: u64,
     pub dropped_gops: u64,
+    /// Media bytes offered to the queue while it was accepting media (not paused
+    /// and not waiting to resync after a new connection).
+    pub offered_bytes: u64,
+    /// Media bytes dropped because the destination could not keep up.
+    pub dropped_bytes: u64,
 }
 
 struct Inner {
@@ -135,12 +140,17 @@ impl PacketQueue {
             }
         }
 
+        if !pkt.is_header {
+            g.stats.offered_bytes += pkt.data.len() as u64;
+        }
+
         // Dropping until the next IDR.
         if g.waiting_keyframe && pkt.kind == Kind::Video && !pkt.is_header {
             if pkt.keyframe {
                 g.waiting_keyframe = false;
             } else {
                 g.stats.dropped_video_frames += 1;
+                g.stats.dropped_bytes += pkt.data.len() as u64;
                 return true;
             }
         }
@@ -185,21 +195,28 @@ impl PacketQueue {
             return; // nothing droppable before the keyframe
         }
         let mut kept = Vec::new();
-        for p in g.q.drain(..idx) {
-            g.bytes -= p.data.len();
+        let drained: Vec<_> = g.q.drain(..idx).collect();
+        for p in drained {
             if p.is_header {
-                g.bytes += p.data.len();
                 kept.push(p);
-            } else if p.kind == Kind::Audio {
-                g.stats.dropped_audio_frames += 1;
             } else {
-                g.stats.dropped_video_frames += 1;
+                Self::count_drop(g, &p);
             }
         }
         for h in kept.into_iter().rev() {
             g.q.push_front(h);
         }
         g.stats.dropped_gops += 1;
+    }
+
+    /// Accounts for a queued media packet removed because of congestion.
+    fn count_drop(g: &mut Inner, p: &MediaPacket) {
+        g.bytes -= p.data.len();
+        g.stats.dropped_bytes += p.data.len() as u64;
+        match p.kind {
+            Kind::Video => g.stats.dropped_video_frames += 1,
+            Kind::Audio => g.stats.dropped_audio_frames += 1,
+        }
     }
 
     fn shed(g: &mut Inner, lim: QueueLimits) {
@@ -210,8 +227,7 @@ impl PacketQueue {
             let p = &g.q[i];
             if p.kind == Kind::Video && !p.keyframe && !p.is_header {
                 let p = g.q.remove(i).unwrap();
-                g.bytes -= p.data.len();
-                g.stats.dropped_video_frames += 1;
+                Self::count_drop(g, &p);
                 g.waiting_keyframe = true; // sending P-frames without their reference is useless
             } else {
                 i += 1;
@@ -235,15 +251,12 @@ impl PacketQueue {
             match cut {
                 Some(idx) => {
                     let mut kept_hdr = Vec::new();
-                    for p in g.q.drain(..idx) {
-                        g.bytes -= p.data.len();
+                    let drained: Vec<_> = g.q.drain(..idx).collect();
+                    for p in drained {
                         if p.is_header {
-                            g.bytes += p.data.len();
                             kept_hdr.push(p);
-                        } else if p.kind == Kind::Audio {
-                            g.stats.dropped_audio_frames += 1;
                         } else {
-                            g.stats.dropped_video_frames += 1;
+                            Self::count_drop(g, &p);
                         }
                     }
                     for h in kept_hdr.into_iter().rev() {
@@ -258,11 +271,7 @@ impl PacketQueue {
                         if p.is_header {
                             g.q.push_back(p);
                         } else {
-                            g.bytes -= p.data.len();
-                            match p.kind {
-                                Kind::Video => g.stats.dropped_video_frames += 1,
-                                Kind::Audio => g.stats.dropped_audio_frames += 1,
-                            }
+                            Self::count_drop(g, &p);
                         }
                     }
                     g.stats.dropped_gops += 1;

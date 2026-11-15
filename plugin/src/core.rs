@@ -8,7 +8,7 @@ use crate::module::text;
 use crate::obs::{c, cstr, sys};
 use crate::rust_output::{Action as RustAction, Slot};
 use crate::target::{self, Runtime, Signal};
-use crate::{null_stream, ui};
+use crate::{null_stream, rust_output, ui};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -136,6 +136,7 @@ impl Core {
             self.config.targets.iter().filter_map(|t| self.runtimes.get(&t.id).map(|rt| rt.model(t))).collect();
         let m = json!({
             "null_stream": {"checked": null_checked, "enabled": self.frontend_ready && !streaming},
+            "congestion_reconnect": {"checked": rust_output::congestion_reconnect(), "enabled": self.frontend_ready},
             "targets": targets,
         });
         self.last_model = m.to_string();
@@ -240,6 +241,31 @@ impl Core {
     }
 }
 
+// ---------------------------------------------------------------- advanced options
+
+/// Where the Advanced menu's reconnect-on-congestion option is kept: the OBS
+/// profile (basic.ini), so obs-multi-rtmp.json keeps the original format.
+const PROFILE_SECTION: &std::ffi::CStr = c"obs-multi-rtmp";
+const KEY_CONGESTION_RECONNECT: &std::ffi::CStr = c"CongestionReconnect";
+
+fn load_congestion_reconnect() {
+    let pc = unsafe { sys::obs_frontend_get_profile_config() };
+    let enabled = !pc.is_null()
+        && unsafe { sys::config_get_bool(pc, PROFILE_SECTION.as_ptr(), KEY_CONGESTION_RECONNECT.as_ptr()) };
+    rust_output::set_congestion_reconnect(enabled);
+}
+
+fn save_congestion_reconnect(enabled: bool) {
+    rust_output::set_congestion_reconnect(enabled);
+    let pc = unsafe { sys::obs_frontend_get_profile_config() };
+    if !pc.is_null() {
+        unsafe {
+            sys::config_set_bool(pc, PROFILE_SECTION.as_ptr(), KEY_CONGESTION_RECONNECT.as_ptr(), enabled);
+            sys::config_save_safe(pc, c"tmp".as_ptr(), std::ptr::null());
+        }
+    }
+}
+
 // ---------------------------------------------------------------- lifecycle
 
 pub fn init() {
@@ -289,6 +315,7 @@ fn handle_frontend_event(event: c_int) {
             }
         }
         EV_PROFILE_CHANGED => {
+            load_congestion_reconnect();
             with_core(|c| {
                 c.force_stop_all();
                 c.runtimes.clear();
@@ -307,6 +334,7 @@ fn handle_frontend_event(event: c_int) {
             });
         }
         EV_FINISHED_LOADING => {
+            load_congestion_reconnect();
             with_core(|c| {
                 c.frontend_ready = true;
                 c.global_hotkeys = Some(hotkeys::register_global());
@@ -434,6 +462,7 @@ fn command(cmd: &Value) {
             };
             with_core(|c| c.runtimes.get(&id).map(|rt| rt.rust_control(slot, action)));
         }
+        "congestion_reconnect" => save_congestion_reconnect(cmd["enabled"].as_bool().unwrap_or(false)),
         "null_stream" => {
             // Outside the state: changing the service can fire frontend events.
             if let Err(e) = null_stream::set_active(cmd["enabled"].as_bool().unwrap_or(false)) {

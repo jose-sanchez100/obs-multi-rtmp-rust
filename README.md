@@ -34,15 +34,25 @@ New in this reimplementation:
   - congestion handling that drops P/B frames first, then whole older GOPs, and never
     drops sequence headers (resent on reconnect);
   - automatic reconnection with exponential backoff and jitter;
+  - optional reconnection on sustained congestion: a stream that keeps dropping at
+    least a quarter of its media for a set time (per stream, in the target's Output
+    settings) gets a new connection, which replaces a slow ingest server or network
+    path. Repeated reconnects double the wait. Turned on for all targets with
+    *Reconnect congested streams automatically* in the Advanced menu;
   - per-stream **pause / resume / reconnect** buttons and live **bitrate, FPS, uptime,
-    reconnects, drops and queue size** in the dock;
-  - per-stream network options: drop threshold, IP address family, bind IP,
-    buffer size, retry backoff and maximum retries.
+    reconnects, drops and queue size** in the dock, with the ingest and local
+    address, TCP round-trip time and retransmissions in the row's tooltip;
+  - connection details in the OBS log: the address each connection went to and from,
+    congestion periods with round-trip time and retransmissions, a summary every
+    5 minutes, and why each reconnect happened;
+  - per-stream network options: drop threshold, reconnect on congestion, IP address
+    family, bind IP, buffer size, retry backoff and maximum retries.
   - TLS via `rustls` (no OpenSSL), independent of OBS's own RTMP output.
 - **Advanced menu** (⚙ next to *Edit targets*) with an option to make OBS's main
   *Start Streaming* button run only the encoders through a null output, so OBS itself
   connects nowhere while targets keep streaming. The original stream service is
-  restored when the option is unchecked.
+  restored when the option is unchecked. The same menu turns reconnection on
+  congestion on or off (off by default; saved in the OBS profile).
 - Bug fixes over the C++ plugin, such as hotkey actions running on the UI thread and
   hotkey bindings being reloaded from the profile.
 

@@ -18,6 +18,7 @@ pub(crate) fn plugin_load() -> bool {
     if unsafe { obs::sys::obs_frontend_get_main_window() }.is_null() {
         return false;
     }
+    obs::install_logger();
     rust_service::register();
     rust_output::register();
     null_stream::register();

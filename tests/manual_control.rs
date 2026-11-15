@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Default)]
 struct Log {
     connects: Arc<AtomicU64>,
+    closes: Arc<AtomicU64>,
+    finishes: Arc<AtomicU64>,
     /// (kind, is_header, keyframe, dts) of each sent packet
     sent: Arc<Mutex<Vec<(Kind, bool, bool, u32)>>>,
 }
@@ -26,7 +28,12 @@ impl Transport for Mock {
         self.0.sent.lock().unwrap().push((p.kind, p.is_header, p.keyframe, p.dts_ms));
         Ok(())
     }
-    fn close(&mut self) {}
+    fn close(&mut self) {
+        self.0.closes.fetch_add(1, Ordering::SeqCst);
+    }
+    fn finish(&mut self) {
+        self.0.finishes.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn pkt(kind: Kind, dts: u32, key: bool, header: bool) -> MediaPacket {
@@ -140,5 +147,13 @@ fn pause_resume_restart_one_session_leaves_the_other_untouched() {
     assert_eq!(last_p, last_b);
 
     assert!(!mgr.pause(9999), "nonexistent id");
+
+    // Pause and restart only drop the connection; the platform keeps the event open.
+    assert_eq!(lp.finishes.load(Ordering::SeqCst) + lb.finishes.load(Ordering::SeqCst), 0);
+    assert!(lp.closes.load(Ordering::SeqCst) >= 2 && lb.closes.load(Ordering::SeqCst) >= 1);
+    // Stopping ends the broadcast, once per session.
+    let closes = (lp.closes.load(Ordering::SeqCst), lb.closes.load(Ordering::SeqCst));
     mgr.shutdown();
+    assert_eq!((lp.finishes.load(Ordering::SeqCst), lb.finishes.load(Ordering::SeqCst)), (1, 1));
+    assert_eq!((lp.closes.load(Ordering::SeqCst), lb.closes.load(Ordering::SeqCst)), closes);
 }

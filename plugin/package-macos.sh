@@ -98,7 +98,7 @@ done
 # Bundle layout OBS expects: Contents/MacOS/<name> and Contents/Resources/ (module data).
 rm -rf "$stage"
 mkdir -p "$plugin/Contents/MacOS" "$plugin/Contents/Resources/locale" "$dist"
-rm -f "$dist"/obs-multi-rtmp-rust-*-macos-universal*
+rm -f "$dist/$name"*  # other versions in dist/ are kept
 lipo -create -output "$plugin/Contents/MacOS/obs-multi-rtmp" "${libs[@]}"
 install_name_tool -id "@rpath/obs-multi-rtmp.plugin/Contents/MacOS/obs-multi-rtmp" "$plugin/Contents/MacOS/obs-multi-rtmp"
 install -m 644 "$here"/data/locale/*.ini "$plugin/Contents/Resources/locale/"

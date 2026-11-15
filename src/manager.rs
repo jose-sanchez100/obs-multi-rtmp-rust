@@ -87,6 +87,11 @@ impl SessionManager {
         self.with(id, |s| s.restart())
     }
 
+    /// See `Session::set_congestion_window`.
+    pub fn set_congestion_window(&self, id: u64, window: std::time::Duration) -> bool {
+        self.with(id, |s| s.set_congestion_window(window))
+    }
+
     fn with(&self, id: u64, f: impl FnOnce(&Session)) -> bool {
         self.sessions.read().unwrap().get(&id).map(|s| f(s)).is_some()
     }

@@ -155,6 +155,12 @@ namespace {
                     break;
             }
 
+            // The long description, when set, explains the option on hover.
+            if (auto tip = obs_property_long_description(p); tip && *tip) {
+                label->setToolTip(QString::fromUtf8(tip));
+                ctrl->setToolTip(QString::fromUtf8(tip));
+            }
+
             QObject::connect(label, &QObject::destroyed, [this]() {
                 label = nullptr;
             });

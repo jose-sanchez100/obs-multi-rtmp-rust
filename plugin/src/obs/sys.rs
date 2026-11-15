@@ -178,6 +178,8 @@ extern "C" {
     pub fn config_get_string(config: *mut config_t, section: *const c_char, name: *const c_char) -> *const c_char;
     pub fn config_get_int(config: *mut config_t, section: *const c_char, name: *const c_char) -> i64;
     pub fn config_get_bool(config: *mut config_t, section: *const c_char, name: *const c_char) -> bool;
+    pub fn config_set_bool(config: *mut config_t, section: *const c_char, name: *const c_char, value: bool);
+    pub fn config_save_safe(config: *mut config_t, temp_ext: *const c_char, backup_ext: *const c_char) -> c_int;
 
     // ---- obs_data
     pub fn obs_data_create() -> *mut obs_data_t;
@@ -289,6 +291,7 @@ extern "C" {
         format: c_int,
     ) -> *mut obs_property_t;
     pub fn obs_property_list_add_string(p: *mut obs_property_t, name: *const c_char, val: *const c_char) -> usize;
+    pub fn obs_property_set_long_description(p: *mut obs_property_t, long_description: *const c_char);
     pub fn obs_properties_add_int(
         props: *mut obs_properties_t,
         name: *const c_char,

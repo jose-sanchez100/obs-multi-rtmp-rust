@@ -270,16 +270,58 @@ fn state_name(s: Option<SessionState>) -> &'static str {
     }
 }
 
-/// "00:12:03 · recon 1 · drop 3 · queue 2.1 MB" (time in LIVE; the green dot already
-/// shows the state), or the state and the last error.
-fn slot_info(s: &obs_rtmp_sessions::SessionSnapshot, live_since: Option<Instant>) -> String {
+/// Signal strength of a stream, 0–4, from what it lost over the last 10 s:
+/// 4 clean, 3 minor loss, 2 unstable, 1 losing a lot; 0 when not LIVE.
+fn slot_health(s: &obs_rtmp_sessions::SessionSnapshot) -> u8 {
+    if s.state != SessionState::Live {
+        return 0;
+    }
+    let drop = s.recent_drop_pct;
+    let retx = s.retrans_pct.unwrap_or(0.0);
+    let mut level = if drop >= 25.0 || retx >= 8.0 {
+        1
+    } else if drop >= 5.0 || retx >= 3.0 {
+        2
+    } else if drop >= 1.0 || retx >= 1.0 {
+        3
+    } else {
+        4
+    };
+    // More than half a megabyte queued: this stream is falling behind.
+    if s.queued_bytes >= 512 * 1024 {
+        level = level.min(2);
+    }
+    level
+}
+
+/// The line under a stream: what is wrong now ("retx 6.2% · RTT 106 ms"), the
+/// state and last error when it is not LIVE, and its history ("recon 3 · drop 412").
+/// Empty while a stream is clean and has never reconnected or dropped.
+fn slot_issue(s: &obs_rtmp_sessions::SessionSnapshot, health: u8) -> String {
     let mut parts = Vec::new();
-    match (s.state, live_since) {
-        (SessionState::Live, Some(t0)) => {
-            let secs = t0.elapsed().as_secs();
-            parts.push(format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60));
+    match s.state {
+        SessionState::Live => {
+            // From 1 %, the threshold where the signal loses its fourth bar.
+            let drop = s.recent_drop_pct;
+            if drop >= 1.0 {
+                parts.push(if drop < 10.0 { format!("dropping {drop:.1}%") } else { format!("dropping {drop:.0}%") });
+            }
+            if let Some(r) = s.retrans_pct.filter(|r| *r >= 1.0) {
+                parts.push(format!("retx {r:.1}%"));
+            }
+            if health < 4 {
+                if let Some(rtt) = s.rtt_ms {
+                    parts.push(format!("RTT {rtt:.0} ms"));
+                }
+            }
         }
-        (st, _) => parts.push(state_name(Some(st)).to_owned()),
+        SessionState::Paused => {}
+        st => {
+            parts.push(state_name(Some(st)).to_owned());
+            if let Some(e) = s.last_error.as_deref().filter(|e| !e.is_empty()) {
+                parts.push(e.to_owned());
+            }
+        }
     }
     if s.reconnects != 0 {
         parts.push(format!("recon {}", s.reconnects));
@@ -287,16 +329,79 @@ fn slot_info(s: &obs_rtmp_sessions::SessionSnapshot, live_since: Option<Instant>
     if s.drops.dropped_video_frames != 0 {
         parts.push(format!("drop {}", s.drops.dropped_video_frames));
     }
-    // A queue of more than half a megabyte means this target is falling behind.
     if s.queued_bytes >= 512 * 1024 {
         parts.push(format!("queue {:.1} MB", s.queued_bytes as f64 / (1024.0 * 1024.0)));
     }
-    if s.state != SessionState::Live && s.state != SessionState::Paused {
-        if let Some(e) = s.last_error.as_deref().filter(|e| !e.is_empty()) {
-            parts.push(e.to_owned());
-        }
-    }
     parts.join(" · ")
+}
+
+/// Tooltip of a stream row: how long it has been LIVE, where the connection went
+/// and how it is doing.
+fn slot_tooltip(s: &obs_rtmp_sessions::SessionSnapshot, live_since: Option<Instant>, fps: Option<f64>) -> String {
+    let mut lines = Vec::new();
+    if let Some(t0) = live_since {
+        let secs = t0.elapsed().as_secs();
+        let mut line = format!("LIVE {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+        if let Some(fps) = fps {
+            line.push_str(&format!(", {} FPS", fps.round() as i64));
+        }
+        lines.push(line);
+    }
+    if let Some(c) = &s.connection {
+        lines.push(format!("Ingest: {} ({})", c.host, c.remote));
+        lines.push(format!("Local: {}", c.local));
+    }
+    if s.state == SessionState::Live {
+        let mut net = Vec::new();
+        if let Some(rtt) = s.rtt_ms {
+            net.push(format!("RTT {rtt:.0} ms"));
+        }
+        if let Some(r) = s.retrans_pct {
+            net.push(format!("retransmitted {r:.1}%"));
+        }
+        net.push(format!("dropped {:.0}% (last 10 s)", s.recent_drop_pct));
+        lines.push(net.join(", "));
+    }
+    if s.reconnects != 0 {
+        lines.push(format!("Reconnects: {} ({} because of congestion)", s.reconnects, s.congestion_reconnects));
+    }
+    if let Some(e) = s.last_error.as_deref().filter(|e| !e.is_empty()) {
+        lines.push(e.to_owned());
+    }
+    lines.join("\n")
+}
+
+/// "Live" / "Backup" in the current language (the locale strings end in ':').
+fn slot_label(i: usize) -> String {
+    let label = text(if i == 0 { "Rust.Primary" } else { "Rust.Backup" });
+    label.strip_suffix(':').unwrap_or(&label).trim().to_owned()
+}
+
+/// What the card's summary says about one stream, if anything is off.
+fn slot_problem(i: usize, s: &obs_rtmp_sessions::SessionSnapshot) -> Option<String> {
+    let key = match s.state {
+        SessionState::Live if slot_health(s) <= 2 => "Summary.Unstable",
+        SessionState::Live => return None,
+        SessionState::Paused => "Summary.Paused",
+        SessionState::Connecting | SessionState::Backoff | SessionState::Idle => "Summary.Reconnecting",
+        SessionState::Stopped => "Summary.Stopped",
+    };
+    Some(text(key).replace("%1", &slot_label(i)))
+}
+
+/// "Live and Backup lossless" when every stream is LIVE and lost nothing over the
+/// last 10 s; None otherwise (problems are reported by `slot_problem`).
+fn clean_note(st: &rust_output::Status) -> Option<String> {
+    let slots: Vec<(usize, &obs_rtmp_sessions::SessionSnapshot)> =
+        [&st.primary, &st.backup].into_iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| (i, s))).collect();
+    if slots.is_empty() || !slots.iter().all(|(_, s)| slot_health(s) == 4) {
+        return None;
+    }
+    let names = match slots.as_slice() {
+        [(a, _), (b, _)] => text("Summary.And").replace("%1", &slot_label(*a)).replace("%2", &slot_label(*b)),
+        _ => slot_label(slots[0].0),
+    };
+    Some(text("Summary.Clean").replace("%1", &names))
 }
 
 fn slot_color(s: SessionState) -> &'static str {
@@ -418,6 +523,9 @@ impl Runtime {
         let (oid, oname) = (c(proto.output_id), c("multi-output"));
         let out = unsafe { Output::from_owned(sys::obs_output_create(oid.as_ptr(), oname.as_ptr(), data_ptr(&settings), std::ptr::null_mut())) }
             .ok_or_else(|| fail("Error.CreateRtmpService"))?;
+        if t.protocol == "RTMP_RUST" {
+            rust_output::set_label(out.as_ptr(), &t.name);
+        }
         self.generation = GENERATION.fetch_add(1, Ordering::Relaxed);
         let ctx = Box::new(SignalCtx { target_id: self.id.clone(), generation: self.generation });
         let sh = unsafe { sys::obs_output_get_signal_handler(out.as_ptr()) };
@@ -634,46 +742,33 @@ impl Runtime {
         self.last_info = now;
     }
 
-    fn dot_color(&self) -> &'static str {
-        if self.reconnecting || self.connecting || self.rust_degraded {
-            "#e6b800"
-        } else if self.is_running() {
-            "#2ecc71"
-        } else if self.last_error_code != 0 {
-            "#e74c3c"
-        } else {
-            "#888888"
-        }
-    }
-
-    /// One row per stream (Live/Backup) of an active Rust target: its own controls,
-    /// bitrate and connection details.
-    fn rust_controls(&self, t: &Target) -> Value {
-        let Some(out) = &self.output else { return Value::Null };
+    /// The Rust engine's streams of an active Rust target.
+    fn rust_status(&self, t: &Target) -> Option<rust_output::Status> {
+        let out = self.output.as_ref()?;
         if t.protocol != "RTMP_RUST" || !self.is_running() {
-            return Value::Null;
+            return None;
         }
-        let Some(st) = rust_output::status(out.as_ptr()) else { return Value::Null };
-        json!({"primary": self.slot_model(0, st.primary.as_ref()), "backup": self.slot_model(1, st.backup.as_ref())})
+        rust_output::status(out.as_ptr())
     }
 
+    /// One row per stream (Live/Backup): its own controls, bitrate, signal and issues.
     fn slot_model(&self, i: usize, snap: Option<&obs_rtmp_sessions::SessionSnapshot>) -> Value {
         let Some(s) = snap else { return Value::Null };
         // The bitrate is only valid if the tick has already measured this state (after
         // pause/resume the previous value is stale).
         let measured = self.slot_state[i] == Some(s.state);
-        let bitrate = if s.state == SessionState::Live && measured {
-            format!("{}  {} FPS", format_bitrate(self.slot_bps[i]), self.slot_fps[i].round() as i64)
-        } else {
-            String::new()
-        };
-        let error = s.last_error.clone().unwrap_or_default();
+        let live = s.state == SessionState::Live && measured;
+        let health = slot_health(s);
+        let issue = slot_issue(s, health);
         json!({
             "paused": s.state == SessionState::Paused,
             "dot": slot_color(s.state),
-            "bitrate": bitrate,
-            "info": slot_info(s, self.slot_live_since[i].filter(|_| measured)),
-            "tooltip": error,
+            "rate": if live { format_bitrate(self.slot_bps[i]) } else { String::new() },
+            "health": health,
+            "issue": issue,
+            // Amber while something is wrong now; history alone stays muted.
+            "warn": !matches!(s.state, SessionState::Live | SessionState::Paused) || (1..=3).contains(&health),
+            "tooltip": slot_tooltip(s, self.slot_live_since[i].filter(|_| measured), live.then_some(self.slot_fps[i])),
         })
     }
 
@@ -683,17 +778,57 @@ impl Runtime {
 
     pub fn model(&self, t: &Target) -> Value {
         let name = if t.name.is_empty() { text("NewStreaming") } else { t.name.clone() };
+        let running = self.is_running();
+        let status = self.rust_status(t);
+        let problems: Vec<String> = status
+            .as_ref()
+            .map(|st| {
+                [&st.primary, &st.backup]
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| s.as_ref().and_then(|s| slot_problem(i, s)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Badge: what the target is doing, in one word.
+        let (badge, badge_key) = if self.reconnecting || self.connecting {
+            ("busy", "Badge.Connecting")
+        } else if running && (self.rust_degraded || !problems.is_empty()) {
+            ("warn", "Badge.Warning")
+        } else if running {
+            ("live", "Badge.Live")
+        } else if self.last_error_code != 0 {
+            ("error", "Badge.Error")
+        } else {
+            ("", "")
+        };
+        // Under the name: the streaming time and what is off, the status message
+        // (connecting, stopping, the stock outputs' bitrate line), or "Stopped".
+        let summary = if status.is_some() && !self.clock.is_empty() {
+            let clean = status.as_ref().and_then(clean_note);
+            std::iter::once(self.clock.clone()).chain(problems).chain(clean).collect::<Vec<_>>().join(" · ")
+        } else if running || self.is_busy() {
+            self.msg.clone()
+        } else {
+            text("Status.Stopped")
+        };
+        // A stopped target keeps its error under the header.
+        let detail = if !running && !self.is_busy() && self.last_error_code != 0 { self.msg.clone() } else { String::new() };
+        let rust = status.map_or(Value::Null, |st| {
+            json!({"primary": self.slot_model(0, st.primary.as_ref()), "backup": self.slot_model(1, st.backup.as_ref())})
+        });
         json!({
             "id": t.id,
             "name": name,
             "enabled": t.enabled,
             "busy": self.is_busy(),
             "button": text(if self.is_busy() { "Status.Stop" } else { "Btn.Start" }),
-            "msg": self.msg,
-            "clock": if self.is_running() { self.clock.as_str() } else { "" },
+            "badge": badge,
+            "badge_text": if badge_key.is_empty() { String::new() } else { text(badge_key) },
+            "summary": summary,
+            "detail": detail,
             "tooltip": if self.tooltip.is_empty() { self.msg.clone() } else { self.tooltip.clone() },
-            "dot": self.dot_color(),
-            "rust": self.rust_controls(t),
+            "rust": rust,
         })
     }
 
