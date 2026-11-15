@@ -71,6 +71,9 @@ fn serve(
                             s.write_all(&packet.bytes).unwrap();
                         }
                     }
+                    ServerSessionEvent::PublishStreamFinished { stream_key, .. } => {
+                        tx.send(("finished".into(), stream_key, 0)).unwrap();
+                    }
                     ServerSessionEvent::VideoDataReceived { data, .. } => {
                         tx.send(("video".into(), String::new(), data.len())).unwrap();
                     }
@@ -137,6 +140,28 @@ fn publishes_to_local_rtmp_server() {
     }
     t.close();
     assert!(t.tcp_stats().is_none());
+}
+
+#[test]
+fn finish_ends_the_publish_but_close_does_not() {
+    let publish = |end: fn(&mut RtmpTransport)| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        let server = std::thread::spawn(move || serve(listener, tx, None));
+        let url = RtmpUrl::parse(&format!("rtmp://127.0.0.1:{port}/live"), Some("k")).unwrap();
+        let mut t = RtmpTransport::new(url);
+        t.connect().unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap().1, "k");
+        end(&mut t);
+        assert!(t.tcp_stats().is_none(), "connection still open");
+        server.join().unwrap();
+        rx.try_iter().map(|e| (e.0, e.1)).collect::<Vec<_>>()
+    };
+    // Stop: the server is told the broadcast ended.
+    assert_eq!(publish(|t| t.finish()), vec![("finished".to_string(), "k".to_string())]);
+    // Reconnect / pause: just a dropped connection.
+    assert_eq!(publish(|t| t.close()), vec![]);
 }
 
 #[test]

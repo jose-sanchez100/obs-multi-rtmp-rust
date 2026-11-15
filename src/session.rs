@@ -21,7 +21,14 @@ pub trait Transport: Send {
     fn poll(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// Drops the connection without ending the broadcast, so the platform waits
+    /// for the stream to come back (reconnects, pause, restart, errors).
     fn close(&mut self);
+    /// Ends the broadcast and then closes; used only when the session is stopped,
+    /// so the platform finishes the live event instead of waiting for a reconnect.
+    fn finish(&mut self) {
+        self.close()
+    }
     /// Addresses of the current connection, once connected.
     fn connection_info(&self) -> Option<ConnectionInfo> {
         None
@@ -487,10 +494,11 @@ impl Worker {
                 }
                 Err(e) => self.fail(&e),
             }
-            t.close();
             if self.stopping() {
+                t.finish();
                 break;
             }
+            t.close();
             if congested || self.paused() || self.sh.restart.load(Ordering::SeqCst) {
                 continue; // congestion or manual action: reconnect without backoff
             }

@@ -7,7 +7,10 @@ use crate::queue::{Kind, MediaPacket};
 use crate::session::{ConnectionInfo, Transport};
 use crate::tcpinfo::{self, TcpStats};
 use bytes::Bytes;
+use rml_rtmp::chunk_io::ChunkSerializer;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
+use rml_rtmp::messages::RtmpMessage;
+use rml_rtmp::rml_amf0::Amf0Value;
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
     StreamMetadata,
@@ -185,6 +188,26 @@ fn publish_status_error(code: &str) -> Option<io::Error> {
         _ => return None,
     };
     Some(io::Error::new(kind, format!("RTMP server: {code}")))
+}
+
+/// How long ending the broadcast may block when the user stops a stream.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// `FCUnpublish(stream key)`, which OBS (librtmp) sends before `deleteStream`.
+/// `rml_rtmp` has no call for it, so it is serialized here with a full chunk
+/// header on stream 0, independent of the session's header compression.
+fn fc_unpublish(stream_key: &str, chunk_size: u32) -> io::Result<Vec<u8>> {
+    let message = RtmpMessage::Amf0Command {
+        command_name: "FCUnpublish".to_string(),
+        transaction_id: 0.0,
+        command_object: Amf0Value::Null,
+        additional_arguments: vec![Amf0Value::Utf8String(stream_key.to_string())],
+    };
+    let payload = message.into_message_payload(RtmpTimestamp::new(0), 0).map_err(other)?;
+    let mut serializer = ChunkSerializer::new();
+    // The session already announced its chunk size; match it without resending it.
+    serializer.set_max_chunk_size(chunk_size, RtmpTimestamp::new(0)).map_err(other)?;
+    Ok(serializer.serialize(&payload, true, false).map_err(other)?.bytes)
 }
 
 impl RtmpTransport {
@@ -452,6 +475,26 @@ impl Transport for RtmpTransport {
             let _ = s.sock().shutdown(std::net::Shutdown::Both);
         }
         self.session = None;
+    }
+
+    fn finish(&mut self) {
+        // Without deleteStream / FCUnpublish (what OBS sends on stop) a platform
+        // such as Facebook takes the close for a dropped connection and keeps
+        // the live event open, waiting for the encoder to come back.
+        if let (Some(stream), Some(sess)) = (self.stream.as_mut(), self.session.as_mut()) {
+            let _ = stream.sock().set_write_timeout(Some(FINISH_TIMEOUT));
+            if let Ok(results) = sess.stop_publishing() {
+                let _ = Self::write_results(stream, results);
+            }
+            if let Ok(bytes) = fc_unpublish(&self.url.stream_key, ClientSessionConfig::new().chunk_size) {
+                let _ = stream.write_all(&bytes).and_then(|_| stream.flush());
+            }
+            if let Stream::Tls(tls) = stream {
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        }
+        self.close();
     }
 
     fn connection_info(&self) -> Option<ConnectionInfo> {
